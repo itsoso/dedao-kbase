@@ -302,6 +302,15 @@ func validResearchModelReviewState(value string) bool {
 	return value == ResearchReviewPending || value == ResearchReviewVerified || value == ResearchReviewRejected
 }
 
+func researchModelRepairInstruction(role ResearchModelRole) (string, error) {
+	schema, err := researchRoleSystemPrompt(role)
+	if err != nil {
+		return "", err
+	}
+	return "A prior generation failed strict validation category " + ResearchOutcomeInvalidModelOutput +
+		". Regenerate the complete JSON object from the original trusted context. Do not repair or quote the prior output. " + schema, nil
+}
+
 func requireResearchModelReferences(values []string, available map[string]bool, kind string) error {
 	for _, value := range uniqueSortedResearchStrings(values) {
 		if !available[value] {

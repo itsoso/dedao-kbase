@@ -13,18 +13,19 @@ import (
 )
 
 type fakeResearchStageModel struct {
-	mu               sync.Mutex
-	calls            map[ResearchModelRole]int
-	models           map[ResearchModelRole][]string
-	verifierVerdict  string
-	err              error
-	usage            ResearchModelUsage
-	plannerOutput    *ResearchPlannerOutput
-	plannerOutputs   []ResearchPlannerOutput
-	extractorOutput  *ResearchExtractorOutput
-	malformedExtract bool
-	synthesizedCount int
-	synthesizedSize  int
+	mu                    sync.Mutex
+	calls                 map[ResearchModelRole]int
+	models                map[ResearchModelRole][]string
+	verifierVerdict       string
+	err                   error
+	usage                 ResearchModelUsage
+	plannerOutput         *ResearchPlannerOutput
+	plannerOutputs        []ResearchPlannerOutput
+	extractorOutput       *ResearchExtractorOutput
+	malformedExtract      bool
+	malformedExtractCount int
+	synthesizedCount      int
+	synthesizedSize       int
 }
 
 type blockingResearchStageModel struct {
@@ -127,7 +128,7 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 		if len(evidenceIDs) == 0 {
 			return ResearchModelUsage{}, errors.New("no evidence marker")
 		}
-		if m.malformedExtract {
+		if m.malformedExtract || m.calls[role] <= m.malformedExtractCount {
 			*value = ResearchExtractorOutput{
 				DecisionSummary: "Malformed case", Facts: []ResearchFact{}, Claims: []ResearchClaim{}, Measurements: []ResearchMeasurement{},
 				Cases: []ResearchCase{{CaseID: "case-a", Role: "current", EvidenceIDs: []string{""}}},
@@ -405,24 +406,32 @@ func TestResearchOrchestratorQuickPathBoundsDraftsBeforeVerifierCostReservation(
 	}
 }
 
-func TestResearchOrchestratorMalformedExtractorOutputTerminatesWithoutReplay(t *testing.T) {
+func TestResearchOrchestratorInvalidExtractorOutputRepairsOnceThenTerminatesWithoutReplay(t *testing.T) {
 	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
-	model.malformedExtract = true
+	model.malformedExtractCount = 2
 	model.plannerOutput = &ResearchPlannerOutput{DecisionSummary: "Search package", ToolCalls: []ResearchPlannedToolCall{{
 		Tool: ResearchToolSearchKnowledge, Arguments: map[string]any{"query": "grounded", "limit": 1},
 	}}}
 	run := createResearchOrchestratorRun(t, research, pkg, "malformed-extractor", ResearchModeDeep,
 		[]string{ResearchSourceKnowledge}, "grounded")
+	run.Budget.MaxCostUSD = 1
+	encodedBudget, err := json.Marshal(run.Budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET budget_json = ? WHERE run_id = ?`, string(encodedBudget), run.RunID); err != nil {
+		t.Fatal(err)
+	}
 	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 8)
-	if result.Run.Status != ResearchFailed || result.Outcome != ResearchOutcomeInvalidModelOutput ||
-		model.callCount(ResearchRoleExtractor) != 1 {
+	if result.Run.Status != ResearchFailed || result.Outcome != ResearchOutcomeExtractorInvalidOutput ||
+		model.callCount(ResearchRoleExtractor) != 2 {
 		t.Fatalf("malformed extractor result=%#v calls=%#v", result, model.calls)
 	}
 	replayed, err := orchestrator.Advance(context.Background(), run.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replayed.Run.Status != ResearchFailed || model.callCount(ResearchRoleExtractor) != 1 {
+	if replayed.Run.Status != ResearchFailed || model.callCount(ResearchRoleExtractor) != 2 {
 		t.Fatalf("malformed extractor replay=%#v calls=%#v", replayed, model.calls)
 	}
 	claimed, err := research.ClaimRunnableRun("second-coordinator", time.Minute)
@@ -431,6 +440,99 @@ func TestResearchOrchestratorMalformedExtractorOutputTerminatesWithoutReplay(t *
 	}
 	if claimed != nil {
 		t.Fatalf("terminal malformed run remained claimable: %#v", claimed)
+	}
+}
+
+func TestResearchOrchestratorRepairsInvalidExtractorOutputAndCompletes(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.malformedExtractCount = 1
+	model.plannerOutput = &ResearchPlannerOutput{DecisionSummary: "Search package", ToolCalls: []ResearchPlannedToolCall{{
+		Tool: ResearchToolSearchKnowledge, Arguments: map[string]any{"query": "grounded", "limit": 1},
+	}}}
+	run := createResearchOrchestratorRun(t, research, pkg, "repair-extractor", ResearchModeDeep,
+		[]string{ResearchSourceKnowledge}, "grounded")
+	run.Budget.MaxModelCalls = 5
+	run.Budget.MaxCostUSD = 1
+	encodedBudget, err := json.Marshal(run.Budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET budget_json = ? WHERE run_id = ?`, string(encodedBudget), run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 12)
+	if result.Run.Status != ResearchCompleted || result.Outcome != ResearchOutcomeCompleted ||
+		model.callCount(ResearchRoleExtractor) != 2 || model.callCount(ResearchRoleSynthesizer) != 1 {
+		t.Fatalf("repair result=%#v calls=%#v", result, model.calls)
+	}
+	var invocations, identities, modelCalls int
+	if err := research.db.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT request_identity) FROM research_model_invocations
+		WHERE run_id = ? AND purpose = ?`, run.RunID, ResearchRoleExtractor).Scan(&invocations, &identities); err != nil {
+		t.Fatal(err)
+	}
+	if err := research.db.QueryRow(`SELECT model_calls FROM research_orchestrator_state WHERE run_id = ?`, run.RunID).Scan(&modelCalls); err != nil {
+		t.Fatal(err)
+	}
+	if invocations != 2 || identities != 2 || modelCalls != 5 {
+		t.Fatalf("extractor invocations=%d identities=%d model_calls=%d", invocations, identities, modelCalls)
+	}
+}
+
+func TestResearchOrchestratorRepairResumeSkipsFailedPrimary(t *testing.T) {
+	orchestrator, _, pkg, model := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, orchestrator.config.ResearchStore, pkg, "repair-resume", ResearchModeDeep,
+		[]string{ResearchSourceChatlog}, "history")
+	run.Budget.MaxCostUSD = 1
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "Plan bounded retrieval"}}
+	model.err = ErrResearchInvalidModelOutput
+	var primary ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:resume", messages, &primary); !errors.Is(err, ErrResearchInvalidModelOutput) {
+		t.Fatalf("primary error=%v", err)
+	}
+	model.err = nil
+	restarted, err := NewResearchOrchestrator(orchestrator.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repaired ResearchPlannerOutput
+	if _, err := restarted.invokeModelWithRepair(context.Background(), run, ResearchRolePlanner, "planner:resume", messages, &repaired); err != nil {
+		t.Fatal(err)
+	}
+	if model.callCount(ResearchRolePlanner) != 2 || len(repaired.ToolCalls) != 1 {
+		t.Fatalf("calls=%d repaired=%#v", model.callCount(ResearchRolePlanner), repaired)
+	}
+}
+
+func TestResearchOrchestratorRepairRespectsBudgetAndErrorType(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		maxCalls int
+		want     error
+	}{
+		{name: "repair has no remaining call", err: ErrResearchInvalidModelOutput, maxCalls: 1, want: ErrResearchBudgetExhausted},
+		{name: "timeout is not repaired", err: context.DeadlineExceeded, maxCalls: 2, want: context.DeadlineExceeded},
+		{name: "provider failure is not repaired", err: errors.New("provider unavailable"), maxCalls: 2},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			orchestrator, _, pkg, model := newResearchOrchestratorTestHarness(t)
+			run := createResearchOrchestratorRun(t, orchestrator.config.ResearchStore, pkg, "repair-budget-"+testCase.name,
+				ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
+			run.Budget.MaxModelCalls = testCase.maxCalls
+			model.err = testCase.err
+			var output ResearchPlannerOutput
+			_, err := orchestrator.invokeModelWithRepair(context.Background(), run, ResearchRolePlanner, "planner:budget", []BookKnowledgeMessage{{Role: "user", Content: "Plan"}}, &output)
+			if testCase.want != nil && !errors.Is(err, testCase.want) {
+				t.Fatalf("error=%v want=%v", err, testCase.want)
+			}
+			if testCase.want == nil && err == nil {
+				t.Fatal("provider error was swallowed")
+			}
+			if model.callCount(ResearchRolePlanner) != 1 {
+				t.Fatalf("calls=%d want=1", model.callCount(ResearchRolePlanner))
+			}
+		})
 	}
 }
 
@@ -1223,6 +1325,10 @@ func TestResearchOrchestratorTypedOutcomesAndCancellation(t *testing.T) {
 		{ErrResearchBudgetExhausted, ResearchOutcomeBudgetExhausted},
 		{ErrResearchCitationMismatch, ResearchOutcomeCitationMismatch},
 		{ErrResearchInvalidModelOutput, ResearchOutcomeInvalidModelOutput},
+		{ErrResearchPlannerInvalidOutput, ResearchOutcomePlannerInvalidOutput},
+		{ErrResearchExtractorInvalidOutput, ResearchOutcomeExtractorInvalidOutput},
+		{ErrResearchSynthesizerInvalidOutput, ResearchOutcomeSynthesizerInvalidOutput},
+		{ErrResearchVerifierInvalidOutput, ResearchOutcomeVerifierInvalidOutput},
 		{ErrResearchEvidenceSourceChanged, ResearchOutcomeSourceChanged},
 		{context.DeadlineExceeded, ResearchOutcomeModelTimeout},
 	}

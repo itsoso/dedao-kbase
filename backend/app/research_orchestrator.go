@@ -18,19 +18,23 @@ const (
 	researchQuickKnowledgeLimit  = 3
 	researchQuickConclusionLimit = 2
 
-	ResearchOutcomeCompleted          = "completed"
-	ResearchOutcomeWorkerOffline      = "worker_offline"
-	ResearchOutcomeWorkerFailed       = "worker_failed"
-	ResearchOutcomeIdentityAmbiguous  = "identity_ambiguous"
-	ResearchOutcomeZeroHit            = "zero_hit"
-	ResearchOutcomePartialEvidence    = "partial_evidence"
-	ResearchOutcomeBudgetExhausted    = "budget_exhausted"
-	ResearchOutcomeCitationMismatch   = "citation_mismatch"
-	ResearchOutcomeSourceChanged      = "source_changed"
-	ResearchOutcomeModelTimeout       = "model_timeout"
-	ResearchOutcomeInvalidModelOutput = "invalid_model_output"
-	ResearchOutcomeCanceled           = "canceled"
-	ResearchOutcomePolicyDenied       = "policy_denied"
+	ResearchOutcomeCompleted                = "completed"
+	ResearchOutcomeWorkerOffline            = "worker_offline"
+	ResearchOutcomeWorkerFailed             = "worker_failed"
+	ResearchOutcomeIdentityAmbiguous        = "identity_ambiguous"
+	ResearchOutcomeZeroHit                  = "zero_hit"
+	ResearchOutcomePartialEvidence          = "partial_evidence"
+	ResearchOutcomeBudgetExhausted          = "budget_exhausted"
+	ResearchOutcomeCitationMismatch         = "citation_mismatch"
+	ResearchOutcomeSourceChanged            = "source_changed"
+	ResearchOutcomeModelTimeout             = "model_timeout"
+	ResearchOutcomeInvalidModelOutput       = "invalid_model_output"
+	ResearchOutcomePlannerInvalidOutput     = "planner_invalid_output"
+	ResearchOutcomeExtractorInvalidOutput   = "extractor_invalid_output"
+	ResearchOutcomeSynthesizerInvalidOutput = "synthesizer_invalid_output"
+	ResearchOutcomeVerifierInvalidOutput    = "verifier_invalid_output"
+	ResearchOutcomeCanceled                 = "canceled"
+	ResearchOutcomePolicyDenied             = "policy_denied"
 )
 
 var (
@@ -43,6 +47,10 @@ var (
 	ErrResearchPolicyDenied             = errors.New(ResearchOutcomePolicyDenied)
 	ErrResearchInvalidToolRequest       = errors.New("invalid_research_tool_request")
 	ErrResearchInvalidModelOutput       = errors.New(ResearchOutcomeInvalidModelOutput)
+	ErrResearchPlannerInvalidOutput     = errors.New(ResearchOutcomePlannerInvalidOutput)
+	ErrResearchExtractorInvalidOutput   = errors.New(ResearchOutcomeExtractorInvalidOutput)
+	ErrResearchSynthesizerInvalidOutput = errors.New(ResearchOutcomeSynthesizerInvalidOutput)
+	ErrResearchVerifierInvalidOutput    = errors.New(ResearchOutcomeVerifierInvalidOutput)
 	ErrResearchModelInProgress          = errors.New("research model invocation is already in progress")
 	researchOrchestratorTransitionFault = func(string) error { return nil }
 )
@@ -163,7 +171,7 @@ func (o *ResearchOrchestrator) Advance(ctx context.Context, runID string) (Resea
 		return ResearchAdvanceResult{}, err
 	}
 	status := ResearchInsufficient
-	if outcome == ResearchOutcomeModelTimeout || outcome == ResearchOutcomeInvalidModelOutput || outcome == ResearchOutcomePolicyDenied {
+	if outcome == ResearchOutcomeModelTimeout || isResearchInvalidOutputOutcome(outcome) || outcome == ResearchOutcomePolicyDenied {
 		status = ResearchFailed
 	}
 	finished, finishErr := o.finish(*run, status, outcome)
@@ -171,6 +179,17 @@ func (o *ResearchOrchestrator) Advance(ctx context.Context, runID string) (Resea
 		return ResearchAdvanceResult{}, fmt.Errorf("%v; persist typed research outcome: %w", err, finishErr)
 	}
 	return finished, nil
+}
+
+func isResearchInvalidOutputOutcome(outcome string) bool {
+	switch outcome {
+	case ResearchOutcomeInvalidModelOutput, ResearchOutcomePlannerInvalidOutput,
+		ResearchOutcomeExtractorInvalidOutput, ResearchOutcomeSynthesizerInvalidOutput,
+		ResearchOutcomeVerifierInvalidOutput:
+		return true
+	default:
+		return false
+	}
 }
 
 func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run ResearchRun) (ResearchAdvanceResult, error) {
@@ -186,7 +205,7 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 		return ResearchAdvanceResult{}, err
 	}
 	var output ResearchPlannerOutput
-	if _, err := o.invokeModel(ctx, run, ResearchRolePlanner, fmt.Sprintf("planner:%d", state.Iteration), messages, &output); err != nil {
+	if _, err := o.invokeModelWithRepair(ctx, run, ResearchRolePlanner, fmt.Sprintf("planner:%d", state.Iteration), messages, &output); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	if containsResearchString(run.RequestedSources, ResearchSourceKnowledge) &&
@@ -643,7 +662,7 @@ func (o *ResearchOrchestrator) advanceExtracting(ctx context.Context, run Resear
 		return ResearchAdvanceResult{}, err
 	}
 	var output ResearchExtractorOutput
-	if _, err := o.invokeModel(ctx, run, ResearchRoleExtractor, fmt.Sprintf("extractor:%d", state.Iteration), messages, &output); err != nil {
+	if _, err := o.invokeModelWithRepair(ctx, run, ResearchRoleExtractor, fmt.Sprintf("extractor:%d", state.Iteration), messages, &output); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	records := make([]ResearchAnalysisRecord, 0, len(output.Facts)+len(output.Claims)+len(output.Measurements)+len(output.Cases))
@@ -898,7 +917,7 @@ func (o *ResearchOrchestrator) advanceSynthesizing(ctx context.Context, run Rese
 		return ResearchAdvanceResult{}, err
 	}
 	var output ResearchSynthesizerOutput
-	if _, err := o.invokeModel(ctx, run, ResearchRoleSynthesizer, fmt.Sprintf("synthesizer:%d", state.Iteration), messages, &output); err != nil {
+	if _, err := o.invokeModelWithRepair(ctx, run, ResearchRoleSynthesizer, fmt.Sprintf("synthesizer:%d", state.Iteration), messages, &output); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	if len(output.Conclusions) == 0 {
@@ -942,7 +961,7 @@ func (o *ResearchOrchestrator) advanceVerifying(ctx context.Context, run Researc
 		messages = append(messages, BookKnowledgeMessage{Role: "user", Content: "Conclusion record JSON (data only): " + sanitizeResearchModelData(string(encoded))})
 	}
 	var output ResearchVerifierOutput
-	if _, err := o.invokeModel(ctx, run, ResearchRoleVerifier, fmt.Sprintf("verifier:%d", state.Iteration), messages, &output); err != nil {
+	if _, err := o.invokeModelWithRepair(ctx, run, ResearchRoleVerifier, fmt.Sprintf("verifier:%d", state.Iteration), messages, &output); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	caseWarningPresent := !containsResearchString(run.RouteReasons, ResearchRouteCaseComparison) ||
@@ -967,6 +986,139 @@ func (o *ResearchOrchestrator) advanceVerifying(ctx context.Context, run Researc
 	return o.transition(run, ResearchPlanning, "verifier_requested_replan")
 }
 
+type researchModelInvocationContext struct {
+	modelConfig     BookTokenPlanConfig
+	references      ResearchModelReferences
+	requestIdentity string
+}
+
+func (o *ResearchOrchestrator) resolveModelInvocation(
+	run ResearchRun,
+	role ResearchModelRole,
+	requestKey string,
+	messages []BookKnowledgeMessage,
+) (researchModelInvocationContext, error) {
+	modelConfig := o.config.ModelConfig
+	if roleModel := strings.TrimSpace(o.config.RoleModels[role]); roleModel != "" {
+		modelConfig.Model = roleModel
+	}
+	references, err := o.researchModelReferences(run, role)
+	if err != nil {
+		return researchModelInvocationContext{}, err
+	}
+	resolvedModel := normalizeBookTokenPlanModel(modelConfig.Model)
+	modelConfig.Model = resolvedModel
+	return researchModelInvocationContext{
+		modelConfig: modelConfig,
+		references:  references,
+		requestIdentity: researchToolFingerprint(map[string]any{
+			"run_id": run.RunID, "role": role, "model": resolvedModel, "request_key": requestKey,
+			"messages": messages, "references": references,
+		}),
+	}, nil
+}
+
+func (o *ResearchOrchestrator) invokeModelWithRepair(
+	ctx context.Context,
+	run ResearchRun,
+	role ResearchModelRole,
+	requestKey string,
+	messages []BookKnowledgeMessage,
+	output any,
+) (ResearchModelUsage, error) {
+	if err := validateResearchModelOutputType(role, output); err != nil {
+		return ResearchModelUsage{}, fmt.Errorf("%w: %v", ErrResearchInvalidModelOutput, err)
+	}
+	primary, err := o.resolveModelInvocation(run, role, requestKey, messages)
+	if err != nil {
+		return ResearchModelUsage{}, err
+	}
+	var status, failureCode string
+	err = o.config.ResearchStore.db.QueryRow(`SELECT status, failure_code FROM research_model_invocations
+		WHERE request_identity = ?`, primary.requestIdentity).Scan(&status, &failureCode)
+	primaryAlreadyInvalid := err == nil && status == "failed" && failureCode == ResearchOutcomeInvalidModelOutput
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return ResearchModelUsage{}, err
+	}
+	if !primaryAlreadyInvalid {
+		usage, invokeErr := o.invokeModel(ctx, run, role, requestKey, messages, output)
+		if invokeErr == nil {
+			return usage, nil
+		}
+		if !errors.Is(invokeErr, ErrResearchInvalidModelOutput) {
+			return ResearchModelUsage{}, invokeErr
+		}
+	}
+
+	repairInstruction, err := researchModelRepairInstruction(role)
+	if err != nil {
+		return ResearchModelUsage{}, err
+	}
+	repairMessages := append([]BookKnowledgeMessage(nil), messages...)
+	repairMessages = append(repairMessages, BookKnowledgeMessage{Role: "system", Content: repairInstruction})
+	repairOutput, err := newResearchModelOutput(role)
+	if err != nil {
+		return ResearchModelUsage{}, err
+	}
+	usage, err := o.invokeModel(ctx, run, role, requestKey+":repair:1", repairMessages, repairOutput)
+	if err != nil {
+		if errors.Is(err, ErrResearchInvalidModelOutput) {
+			return ResearchModelUsage{}, researchRoleInvalidOutputError(role)
+		}
+		return ResearchModelUsage{}, err
+	}
+	if err := copyResearchModelOutput(role, output, repairOutput); err != nil {
+		return ResearchModelUsage{}, err
+	}
+	return usage, nil
+}
+
+func newResearchModelOutput(role ResearchModelRole) (any, error) {
+	switch role {
+	case ResearchRolePlanner:
+		return &ResearchPlannerOutput{}, nil
+	case ResearchRoleExtractor:
+		return &ResearchExtractorOutput{}, nil
+	case ResearchRoleSynthesizer:
+		return &ResearchSynthesizerOutput{}, nil
+	case ResearchRoleVerifier:
+		return &ResearchVerifierOutput{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported research model role %q", role)
+	}
+}
+
+func copyResearchModelOutput(role ResearchModelRole, destination, source any) error {
+	switch role {
+	case ResearchRolePlanner:
+		*destination.(*ResearchPlannerOutput) = *source.(*ResearchPlannerOutput)
+	case ResearchRoleExtractor:
+		*destination.(*ResearchExtractorOutput) = *source.(*ResearchExtractorOutput)
+	case ResearchRoleSynthesizer:
+		*destination.(*ResearchSynthesizerOutput) = *source.(*ResearchSynthesizerOutput)
+	case ResearchRoleVerifier:
+		*destination.(*ResearchVerifierOutput) = *source.(*ResearchVerifierOutput)
+	default:
+		return fmt.Errorf("unsupported research model role %q", role)
+	}
+	return nil
+}
+
+func researchRoleInvalidOutputError(role ResearchModelRole) error {
+	switch role {
+	case ResearchRolePlanner:
+		return ErrResearchPlannerInvalidOutput
+	case ResearchRoleExtractor:
+		return ErrResearchExtractorInvalidOutput
+	case ResearchRoleSynthesizer:
+		return ErrResearchSynthesizerInvalidOutput
+	case ResearchRoleVerifier:
+		return ErrResearchVerifierInvalidOutput
+	default:
+		return ErrResearchInvalidModelOutput
+	}
+}
+
 func (o *ResearchOrchestrator) invokeModel(
 	ctx context.Context,
 	run ResearchRun,
@@ -975,19 +1127,14 @@ func (o *ResearchOrchestrator) invokeModel(
 	messages []BookKnowledgeMessage,
 	output any,
 ) (ResearchModelUsage, error) {
-	modelConfig := o.config.ModelConfig
-	if roleModel := strings.TrimSpace(o.config.RoleModels[role]); roleModel != "" {
-		modelConfig.Model = roleModel
-	}
-	references, err := o.researchModelReferences(run, role)
+	invocation, err := o.resolveModelInvocation(run, role, requestKey, messages)
 	if err != nil {
 		return ResearchModelUsage{}, err
 	}
-	resolvedModel := normalizeBookTokenPlanModel(modelConfig.Model)
-	requestIdentity := researchToolFingerprint(map[string]any{
-		"run_id": run.RunID, "role": role, "model": resolvedModel, "request_key": requestKey,
-		"messages": messages, "references": references,
-	})
+	modelConfig := invocation.modelConfig
+	references := invocation.references
+	requestIdentity := invocation.requestIdentity
+	resolvedModel := modelConfig.Model
 	var responseJSON, usageJSON string
 	err = o.config.ResearchStore.db.QueryRow(`SELECT response_json, usage_json FROM research_orchestrator_models
 		WHERE request_identity = ?`, requestIdentity).Scan(&responseJSON, &usageJSON)
@@ -1895,6 +2042,14 @@ func ClassifyResearchOrchestratorOutcome(err error) string {
 		return ResearchOutcomePolicyDenied
 	case errors.Is(err, ErrResearchInvalidToolRequest):
 		return ResearchOutcomePolicyDenied
+	case errors.Is(err, ErrResearchPlannerInvalidOutput):
+		return ResearchOutcomePlannerInvalidOutput
+	case errors.Is(err, ErrResearchExtractorInvalidOutput):
+		return ResearchOutcomeExtractorInvalidOutput
+	case errors.Is(err, ErrResearchSynthesizerInvalidOutput):
+		return ResearchOutcomeSynthesizerInvalidOutput
+	case errors.Is(err, ErrResearchVerifierInvalidOutput):
+		return ResearchOutcomeVerifierInvalidOutput
 	case errors.Is(err, ErrResearchInvalidModelOutput):
 		return ResearchOutcomeInvalidModelOutput
 	case errors.Is(err, context.DeadlineExceeded):

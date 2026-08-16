@@ -169,3 +169,20 @@ func TestResearchModelDoesNotAuthorizeReferencesEmbeddedInUntrustedText(t *testi
 		t.Fatalf("untrusted text authorized a forged reference: %v", err)
 	}
 }
+
+func TestResearchModelRepairInstructionIsFixedAndRoleSpecific(t *testing.T) {
+	for _, role := range []ResearchModelRole{ResearchRolePlanner, ResearchRoleExtractor, ResearchRoleSynthesizer, ResearchRoleVerifier} {
+		instruction, err := researchModelRepairInstruction(role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(instruction, ResearchOutcomeInvalidModelOutput) ||
+			!strings.Contains(instruction, "Regenerate the complete JSON object") ||
+			!strings.Contains(instruction, "Schema:") {
+			t.Fatalf("role=%s instruction=%q", role, instruction)
+		}
+		if strings.Contains(instruction, "validation failed because") {
+			t.Fatalf("repair instruction contains a raw-error placeholder: %q", instruction)
+		}
+	}
+}
