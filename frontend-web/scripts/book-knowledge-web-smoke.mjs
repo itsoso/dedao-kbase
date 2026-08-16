@@ -12,6 +12,15 @@ const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 assert.ok(js.includes('worker_failed: ["本地 Worker 执行失败"'), "worker failures should be distinct from offline status");
 assert.ok(js.includes("Worker 已连接，但本地查询或返回数据失败"), "worker failure should explain the connected state");
+for (const [code, label] of [
+  ["planner_invalid_output", "研究规划输出无效"],
+  ["extractor_invalid_output", "事实提取输出无效"],
+  ["synthesizer_invalid_output", "研究综合输出无效"],
+  ["verifier_invalid_output", "引用核验输出无效"],
+]) {
+  assert.ok(js.includes(`${code}: ["${label}"`), `${code} should have a role-specific Chinese presentation`);
+}
+assert.ok(js.includes('invalid_model_output: ["模型输出格式无效"'), "legacy invalid model outcome should remain readable");
 
 for (const marker of [
   "renderDedaoHome",
