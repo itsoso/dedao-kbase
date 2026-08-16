@@ -1209,7 +1209,7 @@ func TestResearchPlannerPromptListsOnlyRunAuthorizedEntryTools(t *testing.T) {
 	}{
 		{"knowledge", ResearchSourceKnowledge, ResearchToolSearchKnowledge, []string{`"query"`, `"limit"`}},
 		{"prior runs", ResearchSourcePriorRuns, ResearchToolSearchPriorRuns, []string{`"query"`, `"limit"`}},
-		{"chatlog", ResearchSourceChatlog, ResearchWorkerToolSearchChatlog, []string{`"talker_ref"`, `"time_from"`, `"time_to"`, `"limit"`}},
+		{"chatlog", ResearchSourceChatlog, ResearchWorkerToolSearchChatlog, []string{`"talker_ref"`, `"time_from"`, `"time_to"`, `"limit"`, `conversation or group reference, never a sender display name`, `message-sender display-name hint; put the author here`, `one literal message-content term; never concatenate independent terms with spaces`}},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
