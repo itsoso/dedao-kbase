@@ -1056,6 +1056,18 @@ func (o *ResearchOrchestrator) invokeModelWithRepair(
 	}
 	repairMessages := append([]BookKnowledgeMessage(nil), messages...)
 	repairMessages = append(repairMessages, BookKnowledgeMessage{Role: "system", Content: repairInstruction})
+	repair, err := o.resolveModelInvocation(run, role, requestKey+":repair:1", repairMessages)
+	if err != nil {
+		return ResearchModelUsage{}, err
+	}
+	err = o.config.ResearchStore.db.QueryRow(`SELECT status, failure_code FROM research_model_invocations
+		WHERE request_identity = ?`, repair.requestIdentity).Scan(&status, &failureCode)
+	if err == nil && status == "failed" && failureCode == ResearchOutcomeInvalidModelOutput {
+		return ResearchModelUsage{}, researchRoleInvalidOutputError(role)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return ResearchModelUsage{}, err
+	}
 	repairOutput, err := newResearchModelOutput(role)
 	if err != nil {
 		return ResearchModelUsage{}, err

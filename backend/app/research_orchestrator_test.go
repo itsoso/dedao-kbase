@@ -503,16 +503,63 @@ func TestResearchOrchestratorRepairResumeSkipsFailedPrimary(t *testing.T) {
 	}
 }
 
+func TestResearchOrchestratorFailedRepairResumeDoesNotCallProviderAgain(t *testing.T) {
+	orchestrator, _, pkg, model := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, orchestrator.config.ResearchStore, pkg, "failed-repair-resume",
+		ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
+	run.Budget.MaxCostUSD = 1
+	model.err = ErrResearchInvalidModelOutput
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "Plan bounded retrieval"}}
+	var first ResearchPlannerOutput
+	if _, err := orchestrator.invokeModelWithRepair(context.Background(), run, ResearchRolePlanner, "planner:failed-repair", messages, &first); !errors.Is(err, ErrResearchPlannerInvalidOutput) {
+		t.Fatalf("first error=%v", err)
+	}
+	if model.callCount(ResearchRolePlanner) != 2 {
+		t.Fatalf("calls=%d want=2", model.callCount(ResearchRolePlanner))
+	}
+	var beforeModelCalls, beforeAttempts int
+	if err := orchestrator.config.ResearchStore.db.QueryRow(`SELECT model_calls FROM research_orchestrator_state WHERE run_id = ?`, run.RunID).Scan(&beforeModelCalls); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.config.ResearchStore.db.QueryRow(`SELECT COUNT(*) FROM research_model_invocation_attempts WHERE run_id = ?`, run.RunID).Scan(&beforeAttempts); err != nil {
+		t.Fatal(err)
+	}
+	model.err = nil
+	restarted, err := NewResearchOrchestrator(orchestrator.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replay ResearchPlannerOutput
+	if _, err := restarted.invokeModelWithRepair(context.Background(), run, ResearchRolePlanner, "planner:failed-repair", messages, &replay); !errors.Is(err, ErrResearchPlannerInvalidOutput) {
+		t.Fatalf("replay error=%v", err)
+	}
+	if model.callCount(ResearchRolePlanner) != 2 {
+		t.Fatalf("failed repair was called again: calls=%d", model.callCount(ResearchRolePlanner))
+	}
+	var afterModelCalls, afterAttempts int
+	if err := orchestrator.config.ResearchStore.db.QueryRow(`SELECT model_calls FROM research_orchestrator_state WHERE run_id = ?`, run.RunID).Scan(&afterModelCalls); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.config.ResearchStore.db.QueryRow(`SELECT COUNT(*) FROM research_model_invocation_attempts WHERE run_id = ?`, run.RunID).Scan(&afterAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if afterModelCalls != beforeModelCalls || afterAttempts != beforeAttempts {
+		t.Fatalf("durable accounting changed on replay: calls %d->%d attempts %d->%d", beforeModelCalls, afterModelCalls, beforeAttempts, afterAttempts)
+	}
+}
+
 func TestResearchOrchestratorRepairRespectsBudgetAndErrorType(t *testing.T) {
 	tests := []struct {
 		name     string
 		err      error
 		maxCalls int
+		maxCost  float64
 		want     error
 	}{
-		{name: "repair has no remaining call", err: ErrResearchInvalidModelOutput, maxCalls: 1, want: ErrResearchBudgetExhausted},
-		{name: "timeout is not repaired", err: context.DeadlineExceeded, maxCalls: 2, want: context.DeadlineExceeded},
-		{name: "provider failure is not repaired", err: errors.New("provider unavailable"), maxCalls: 2},
+		{name: "repair has no remaining call", err: ErrResearchInvalidModelOutput, maxCalls: 1, maxCost: 1, want: ErrResearchBudgetExhausted},
+		{name: "repair has insufficient remaining cost", err: ErrResearchInvalidModelOutput, maxCalls: 2, maxCost: 0.25, want: ErrResearchBudgetExhausted},
+		{name: "timeout is not repaired", err: context.DeadlineExceeded, maxCalls: 2, maxCost: 1, want: context.DeadlineExceeded},
+		{name: "provider failure is not repaired", err: errors.New("provider unavailable"), maxCalls: 2, maxCost: 1},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -520,6 +567,7 @@ func TestResearchOrchestratorRepairRespectsBudgetAndErrorType(t *testing.T) {
 			run := createResearchOrchestratorRun(t, orchestrator.config.ResearchStore, pkg, "repair-budget-"+testCase.name,
 				ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
 			run.Budget.MaxModelCalls = testCase.maxCalls
+			run.Budget.MaxCostUSD = testCase.maxCost
 			model.err = testCase.err
 			var output ResearchPlannerOutput
 			_, err := orchestrator.invokeModelWithRepair(context.Background(), run, ResearchRolePlanner, "planner:budget", []BookKnowledgeMessage{{Role: "user", Content: "Plan"}}, &output)
