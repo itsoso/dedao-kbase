@@ -1169,7 +1169,7 @@ func TestResearchRoleSystemPromptRequiresEachStructuredOutputContract(t *testing
 		required []string
 	}{
 		{ResearchRolePlanner, []string{`"tool_calls"`, `"tool"`, `"arguments"`}},
-		{ResearchRoleExtractor, []string{`"facts"`, `"claims"`, `"measurements"`, `"cases"`, `"evidence_ids"`, `"review_state"("pending"|"verified"|"rejected")`, `use "pending" for newly extracted items`}},
+		{ResearchRoleExtractor, []string{`"facts"`, `"claims"`, `"measurements"`, `"cases"`, `"evidence_ids"`, `"review_state"("pending"|"verified"|"rejected")`, `use "pending" for newly extracted items`, `"value":0.0`, `"confidence":0.8`, `"age":0`, `"stage_day":0`, `"symptoms":["string"]`, `"measurements":{"metric_name":0.0}`, `age, stage_day, and every measurement value must be JSON numbers`}},
 		{ResearchRoleSynthesizer, []string{`"conclusions"`, `"support_evidence_ids"`, `"citation_ids"`, `"confidence"`}},
 		{ResearchRoleVerifier, []string{`"verdict"`, `"verified_conclusion_ids"`, `"gaps"`, `"warnings"`}},
 	}
