@@ -1380,6 +1380,24 @@ func TestResearchOrchestratorRetriesFailedModelInvocation(t *testing.T) {
 	}
 }
 
+func TestResearchModelInvocationFailurePersistsBoundedCode(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "model-invalid-output-code",
+		ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
+	model.err = ErrResearchInvalidModelOutput
+	var output ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:invalid", []BookKnowledgeMessage{{Role: "user", Content: "Plan"}}, &output); !errors.Is(err, ErrResearchInvalidModelOutput) {
+		t.Fatalf("error=%v", err)
+	}
+	var status, failureCode string
+	if err := research.db.QueryRow(`SELECT status, failure_code FROM research_model_invocations WHERE run_id = ?`, run.RunID).Scan(&status, &failureCode); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || failureCode != ResearchOutcomeInvalidModelOutput {
+		t.Fatalf("status=%q failure_code=%q", status, failureCode)
+	}
+}
+
 func TestResearchOrchestratorRecoversOldEpochInvocationAndFencesStaleCompletion(t *testing.T) {
 	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
 	model := &recoveringResearchStageModel{firstStarted: make(chan struct{}), releaseFirst: make(chan struct{})}

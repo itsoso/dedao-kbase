@@ -1084,7 +1084,7 @@ func (o *ResearchOrchestrator) invokeModel(
 			}
 		}
 		reservationResult, err = startTx.Exec(`UPDATE research_model_invocations SET status = 'running', attempt = attempt + 1,
-			lease_epoch = ?, model = ?, estimated_cost_usd = ?, updated_at = ?
+			lease_epoch = ?, model = ?, estimated_cost_usd = ?, failure_code = '', updated_at = ?
 			WHERE request_identity = ? AND attempt = ? AND status = ?`, run.LeaseEpoch, resolvedModel,
 			priorAttemptCost+reservation, now, requestIdentity, existingAttempt, existingStatus)
 	}
@@ -1124,9 +1124,9 @@ func (o *ResearchOrchestrator) invokeModel(
 		failureTx, txErr := o.config.ResearchStore.db.Begin()
 		if txErr == nil {
 			if fenceErr := assertResearchRunLeaseTx(failureTx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); fenceErr == nil {
-				result, updateErr := failureTx.Exec(`UPDATE research_model_invocations SET status = 'failed', updated_at = ?
+				result, updateErr := failureTx.Exec(`UPDATE research_model_invocations SET status = 'failed', failure_code = ?, updated_at = ?
 					WHERE request_identity = ? AND lease_epoch = ? AND status = 'running'`,
-					o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano), requestIdentity, run.LeaseEpoch)
+					researchModelFailureCode(err), o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano), requestIdentity, run.LeaseEpoch)
 				if updateErr != nil {
 					txErr = updateErr
 				} else if changed, changesErr := result.RowsAffected(); changesErr != nil || changed != 1 {
@@ -1211,7 +1211,7 @@ func (o *ResearchOrchestrator) invokeModel(
 	}
 	if inserted == 1 {
 		updated, err := tx.Exec(`UPDATE research_model_invocations SET status = 'completed', input_tokens = ?,
-			output_tokens = ?, estimated_cost_usd = ?, updated_at = ? WHERE request_identity = ? AND lease_epoch = ?`,
+			output_tokens = ?, estimated_cost_usd = ?, failure_code = '', updated_at = ? WHERE request_identity = ? AND lease_epoch = ?`,
 			usage.InputTokens, usage.OutputTokens, cumulativeAttemptCost, now, requestIdentity, run.LeaseEpoch)
 		if err != nil {
 			return ResearchModelUsage{}, err
@@ -1240,6 +1240,17 @@ func (o *ResearchOrchestrator) invokeModel(
 		return ResearchModelUsage{}, err
 	}
 	return usage, nil
+}
+
+func researchModelFailureCode(err error) string {
+	switch {
+	case errors.Is(err, ErrResearchInvalidModelOutput):
+		return ResearchOutcomeInvalidModelOutput
+	case errors.Is(err, context.DeadlineExceeded):
+		return ResearchOutcomeModelTimeout
+	default:
+		return "model_error"
+	}
 }
 
 func validateResearchModelOutputWithReferences(role ResearchModelRole, output any, references ResearchModelReferences) error {

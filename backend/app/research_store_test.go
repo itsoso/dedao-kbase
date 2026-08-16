@@ -52,6 +52,36 @@ func TestResearchStoreCreatesSchemaAndPersistsRunAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestResearchStoreMigrationAddsModelInvocationFailureCode(t *testing.T) {
+	store := newResearchStoreForTest(t)
+	rows, err := store.db.Query(`PRAGMA table_info(research_model_invocations)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if name == "failure_code" {
+			found = true
+			if columnType != "TEXT" || notNull != 1 || fmt.Sprint(defaultValue) != "''" {
+				t.Fatalf("failure_code type=%q notNull=%d default=%v", columnType, notNull, defaultValue)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("research_model_invocations.failure_code is missing")
+	}
+}
+
 func TestResearchStoreCreatesRunIdempotentlyAndRejectsPayloadConflict(t *testing.T) {
 	store := newResearchStoreForTest(t)
 	input := researchStoreTestInput("same-request")

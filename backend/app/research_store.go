@@ -206,6 +206,7 @@ func migrateResearchStore(db *sql.DB) error {
 			invocation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
 			request_identity TEXT NOT NULL UNIQUE, model TEXT NOT NULL, purpose TEXT NOT NULL,
 			status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, lease_epoch TEXT NOT NULL DEFAULT '',
+			failure_code TEXT NOT NULL DEFAULT '',
 			input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
 			estimated_cost_usd REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		)`,
@@ -239,7 +240,10 @@ func migrateResearchStore(db *sql.DB) error {
 	if err := ensureResearchStoreColumn(db, "research_model_invocations", "attempt", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
-	return ensureResearchStoreColumn(db, "research_model_invocations", "lease_epoch", `TEXT NOT NULL DEFAULT ''`)
+	if err := ensureResearchStoreColumn(db, "research_model_invocations", "lease_epoch", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	return ensureResearchStoreColumn(db, "research_model_invocations", "failure_code", `TEXT NOT NULL DEFAULT ''`)
 }
 
 func ensureResearchStoreColumn(db *sql.DB, table, column, definition string) error {
