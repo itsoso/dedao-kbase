@@ -11444,6 +11444,24 @@ function researchFailurePresentation(failure) {
   return ({ worker_offline: ["本地 Worker 未在线", "确认 macOS Worker 已启动并连接后，再新建一次研究。"], worker_failed: ["本地 Worker 执行失败", "Worker 已连接，但本地查询或返回数据失败；请在 Agent 健康页检查 Chatlog 服务后重试。"], identity_ambiguous: ["身份仍有歧义", "在身份候选区确认正确对象；不要仅凭昵称推断。"], zero_hit: ["没有找到可用证据", "调整关键词、时间范围或增加一个允许的数据源。"], partial_evidence: ["只取得部分证据", "报告会保留缺口，不会把缺失部分补写成事实。"], budget_exhausted: ["研究预算已用完", "缩小问题范围，或新建深度研究并提高受控预算。"], citation_mismatch: ["引用核验未通过", "检查来源是否发生变化后重新运行。"], source_changed: ["来源内容已变化", "重新检索并生成新的可核验快照。"], model_timeout: ["模型调用超时", "稍后重试；已完成步骤不会被描述为最终结论。"], planner_invalid_output: ["研究规划输出无效", "系统已自动修复一次，但规划结果仍不符合工具和结构约束；请检查规划模型后重试。"], extractor_invalid_output: ["事实提取输出无效", "系统已自动修复一次，但事实或引用仍未通过严格校验；请检查提取模型后重试。"], synthesizer_invalid_output: ["研究综合输出无效", "系统已自动修复一次，但结论结构或证据引用仍无效；请检查综合模型后重试。"], verifier_invalid_output: ["引用核验输出无效", "系统已自动修复一次，但核验结果仍不符合结论引用约束；请检查核验模型后重试。"], invalid_model_output: ["模型输出格式无效", "系统已终止本次运行且不会重复执行；请检查角色模型或稍后新建研究。"] })[code] || ["研究未能完成", "查看阶段记录并缩小范围后重新发起。"];
 }
 
+function validateResearchCreateDraft(draft) {
+  if (!draft?.question) {
+    return "研究问题为必填。请先提出一个明确、可验证的问题。";
+  }
+  if (!draft?.packageID || !draft?.packageVersion) {
+    return "Agent Package 和版本为必填。请从 Agent 管理选择已发布且支持研究的版本。";
+  }
+  return "";
+}
+
+function researchCreateErrorMessage(error) {
+  const code = String(error?.message || error || "");
+  return ({
+    "invalid_research_request": "研究参数无效。请确认研究问题、Agent Package、版本、模式和来源均已填写。",
+    "research_package_not_eligible": "当前 Agent Package 不支持所选模式或来源。请前往 Agent 管理选择已发布且支持研究的版本。",
+  })[code] || code;
+}
+
 function researchRecentRunIDs() {
   try {
     const parsed = JSON.parse(window.localStorage?.getItem(researchRecentRunsKey) || "[]");
@@ -11526,11 +11544,11 @@ function renderResearchWorkspace(route = getResearchRoute()) {
   const modeChoices = [["quick", "快速检索"], ["auto", "自动判断"], ["deep", "深度研究"]];
   renderShell(`<main class="research-workspace">
     <header class="research-workspace__heading"><div><p class="web-kicker">RESEARCH DOSSIER / 研究案卷</p><h1>研究工作台</h1></div><p>围绕一个明确问题，记录检索范围、证据选择、身份边界与引用核验。</p></header>
-    <form class="research-launchpad" id="research-create-form" aria-label="发起研究">
+    <form class="research-launchpad" id="research-create-form" aria-label="发起研究" novalidate>
       <label class="research-launchpad__question"><span>研究问题</span><textarea name="question" rows="2" required placeholder="例如：比较当前建议与去年同类案例，有哪些适用差异？">${escapeHTML(researchState.draft.question)}</textarea></label>
       <fieldset><legend>模式</legend>${modeChoices.map(([value, label]) => `<label><input type="radio" name="mode" value="${value}" ${researchState.draft.mode === value ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
       <fieldset><legend>来源</legend>${sourceChoices.map(([value, label]) => `<label><input type="checkbox" name="sources" value="${value}" ${researchState.draft.sources.includes(value) ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
-      <div class="research-launchpad__scope"><label><span>Agent Package</span><input name="package_id" value="${escapeAttribute(researchState.draft.packageID)}" placeholder="可选"></label><label><span>版本</span><input name="package_version" value="${escapeAttribute(researchState.draft.packageVersion)}" placeholder="可选"></label></div>
+      <div class="research-launchpad__scope"><label><span>Agent Package（必填） · <a href="${escapeAttribute(ROUTES.agentPackages)}">去 Agent 管理选择</a></span><input name="package_id" value="${escapeAttribute(researchState.draft.packageID)}" placeholder="必填" required></label><label><span>版本（必填）</span><input name="package_version" value="${escapeAttribute(researchState.draft.packageVersion)}" placeholder="必填" required></label></div>
       <button class="button button-primary" type="submit" ${researchState.loading.create ? "disabled" : ""}>${researchState.loading.create ? "正在创建…" : "开始研究"}</button>
     </form>
     ${researchState.message ? `<p class="research-workspace__message" aria-live="polite">${escapeHTML(researchState.message)}</p>` : `<p class="visually-hidden" aria-live="polite">研究工作台已就绪</p>`}
@@ -11563,6 +11581,12 @@ async function createResearchRun(event) {
   const data = new FormData(event.currentTarget);
   const sources = data.getAll("sources").map(String);
   researchState.draft = { question: String(data.get("question") || "").trim(), mode: String(data.get("mode") || "auto"), sources: sources.length ? sources : ["knowledge"], packageID: String(data.get("package_id") || "").trim(), packageVersion: String(data.get("package_version") || "").trim() };
+  const validationMessage = validateResearchCreateDraft(researchState.draft);
+  if (validationMessage) {
+    researchState.message = validationMessage;
+    renderResearchWorkspace({ runID: "" });
+    return;
+  }
   researchState.loading.create = true;
   researchState.message = "正在建立受控研究运行…";
   renderResearchWorkspace({ runID: "" });
@@ -11578,7 +11602,7 @@ async function createResearchRun(event) {
     clearResearchRunDetail(runID);
     await boot();
   } catch (error) {
-    researchState.message = error instanceof Error ? error.message : String(error);
+    researchState.message = researchCreateErrorMessage(error);
     renderResearchWorkspace({ runID: "" });
   } finally {
     researchState.loading.create = false;

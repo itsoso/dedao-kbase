@@ -51,6 +51,18 @@ assert.ok(js.includes("clearResearchRunDetail"), "route changes should clear sta
 assert.ok(js.includes('headers: { "Idempotency-Key"'), "run creation should use an idempotency key");
 assert.ok(js.includes('capabilities.includes("deep_research")'), "Agent console should expose Research only for opted-in packages");
 
+const launchpad = js.match(/<form class="research-launchpad"[\s\S]*?<\/form>/)?.[0] || "";
+assert.match(launchpad, /name="package_id"[^>]*required/, "Agent Package should be required before creating a run");
+assert.match(launchpad, /name="package_version"[^>]*required/, "Agent Package version should be required before creating a run");
+assert.ok(launchpad.includes("ROUTES.agentPackages"), "Research workspace should link to Agent Package management for selection");
+assert.ok(js.includes("validateResearchCreateDraft"), "Research creation should validate the package contract before calling the API");
+assert.ok(js.includes("Agent Package 和版本为必填"), "Missing package guidance should be actionable Chinese text");
+assert.ok(js.includes("研究问题为必填"), "Custom validation should preserve the required research question contract");
+assert.ok(js.includes('"invalid_research_request"'), "Research creation should map invalid request errors");
+assert.ok(js.includes('"research_package_not_eligible"'), "Research creation should map ineligible package errors");
+const createRun = js.match(/async function createResearchRun[\s\S]*?\n\}/)?.[0] || "";
+assert.ok(createRun.indexOf("validateResearchCreateDraft") < createRun.indexOf('apiFetch("/api/research/runs"'), "Research validation should run before the create request");
+
 const renderer = js.match(/function renderResearchWorkspace\([\s\S]*?\n\}/)?.[0] || "";
 for (const forbidden of ["思维链", "隐藏推理", "raw worker", "Worker 原始", "私有标识符", "完整聊天导出", "Token 输入"]) {
   assert.ok(!renderer.includes(forbidden), `Research renderer must not expose ${forbidden}`);
@@ -80,5 +92,6 @@ assert.ok(mobile.includes("grid-template-columns: minmax(0, 1fr)"), "mobile rese
 assert.ok(css.includes("prefers-reduced-motion: reduce"), "research motion should respect reduced motion");
 assert.ok(html.includes("20260814-research-workspace"), "Research workspace should publish fresh assets");
 assert.ok(html.includes("20260815-research-model-output"), "Research failure guidance should publish with a fresh app asset");
+assert.ok(html.includes("20260817-research-package-required"), "Required package validation should publish with a fresh app asset");
 
 console.log("Research workspace smoke passed");
