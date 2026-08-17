@@ -959,3 +959,33 @@ does not invent medical advice.
 
 G5 and G6 are PASS for the extractor-contract remediation. Earlier failed
 Runs remain immutable audit history and are not rewritten by the deployment.
+
+### Required Research package validation rollout
+
+Revision `f68fb555e675e52814339de708c34d5c6e204998` was fast-forwarded to
+canonical main and rebuilt on the production Linux host. The release archive
+SHA-256 is
+`15cc2e65f326329823b4876ef8186cb119612fbae34494c66160355ca1958f89` and the
+candidate KBase binary SHA-256 is
+`0ed4c97a73c62d65294abd49eb6e1b2be3f114b9b97bc38d861f297842649ba0`.
+The frontend production build, Research workspace smokes, module verification,
+vet, the complete Go suite, production configuration check, and an isolated
+exact-revision health probe all passed before cutover.
+
+The cutover replaced only the KBase binary and static Web directory. It did not
+change databases, Worker binaries, credentials, model configuration, or the
+reverse proxy. The recoverable backup is retained at
+`/opt/dedao-kbase/backups/research-package-required-f68fb55-20260817T145609Z`.
+Loopback and public health report the exact revision; the service is active with
+exit status zero and no restarts. Public `/`, `/research`, `/agent-packages`,
+and `/app.js` returned 200, while the anonymous Research API remained 401.
+The post-cutover log window contained no panic, fatal startup, or segmentation
+failure.
+
+Authenticated browser verification confirmed that the live Research form now
+labels Agent Package and version as required, provides a direct link to Agent
+management, and keeps the Research workspace usable. Client validation blocks
+creation before the API call when the question, Package ID, or version is
+missing, and the two relevant server error codes now render bounded Chinese
+guidance. No evaluation Run was created during rollout verification. G5 and G6
+are PASS for this UI/API contract correction.
