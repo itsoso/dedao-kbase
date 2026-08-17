@@ -931,3 +931,31 @@ smokes, Research process smoke, Chatlog packaging smoke, system-map drift,
 privacy, and diff checks exited zero. G4 is PASS; G5/G6 remain pending until
 the final clean-main revision and matching macOS Worker are deployed and the
 production case is repeated.
+
+### Final extractor-contract deployment and real-data acceptance
+
+Revision `a2cf8479afbf06ef35ea4c448625d86b8d0eaeb9` was pushed to canonical
+main and built on the production host. The candidate binary SHA-256 is
+`6508fda345117e22ef3ed044852c64d8771b9948de00c3f8cdba506847be2fbd`; the
+isolated candidate health probe and `--check-config` both passed. A first
+cutover probe used the wrong loopback port and was automatically rolled back;
+the second cutover used the configured `127.0.0.1:8719` endpoint and passed.
+The production health endpoint now reports revision
+`a2cf8479afbf06ef35ea4c448625d86b8d0eaeb9`, with zero restarts and exit
+status zero. The previous server binary is recoverable at
+`/opt/dedao-kbase/backups/research-extractor-a2cf847-20260817T062503Z`.
+
+Fresh real-data acceptance created Run
+`research-run-1c7d7c7020e58f8f5689b6611b7f48b7` from the 益家知研 Research
+package. It completed with 40 evidence items (35 Chatlog messages and 5
+knowledge-release items), two Chatlog searches, eight exact fetches, and
+eight bounded context expansions. Planner, extractor, synthesizer, and
+verifier each completed on their first attempt; no `worker_offline`,
+`worker_failed`, or `extractor_invalid_output` outcome was recorded. Four
+conclusion drafts and four verified conclusions were persisted and the report
+page re-opened with citation links. The report correctly states when the
+selected date-scoped evidence does not support a substantive comparison; it
+does not invent medical advice.
+
+G5 and G6 are PASS for the extractor-contract remediation. Earlier failed
+Runs remain immutable audit history and are not rewritten by the deployment.
