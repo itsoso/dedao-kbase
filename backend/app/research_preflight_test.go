@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -299,6 +300,9 @@ func TestResearchPreflightEligibility(t *testing.T) {
 		{name: "untrusted evaluation rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
 			facts.EvaluationPassed = false
 		}},
+		{name: "package without complete runtime validation rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.RunnablePackageValidated = false
+		}},
 		{name: "mode outside policy rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
 			facts.Package.ResearchPolicy.Modes = []string{ResearchModeQuick}
 		}},
@@ -352,6 +356,29 @@ func TestResearchPreflightEligibilityExplicitConstraintNeverWidens(t *testing.T)
 	}, []ResearchPreflightPackageFacts{eligible, testResearchPreflightPackageFacts(t, "other-agent")})
 	if len(candidates) != 1 || candidates[0].PackageID != "eligible-agent" {
 		t.Fatalf("explicit constraint did not narrow candidates: %#v", candidates)
+	}
+}
+
+func TestResearchPreflightEligibilityRejectsPackageChangedAfterValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*AgentPackage)
+	}{
+		{name: "version changed", mutate: func(pkg *AgentPackage) { pkg.Version = "4.0.0" }},
+		{name: "content changed", mutate: func(pkg *AgentPackage) { pkg.ModelPolicy.TimeoutMS++ }},
+		{name: "hash changed", mutate: func(pkg *AgentPackage) { pkg.ContentHash = "sha256:changed" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			facts := testResearchPreflightPackageFacts(t, "changed-agent")
+			test.mutate(&facts.Package)
+			candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+				Mode: ResearchModeAuto, Question: "compare evidence",
+			}, []ResearchPreflightPackageFacts{facts})
+			if len(candidates) != 0 {
+				t.Fatalf("package changed after validation remained eligible: %#v", candidates)
+			}
+		})
 	}
 }
 
@@ -410,6 +437,7 @@ func TestRankResearchPreflightCandidatesReadinessDoesNotChangeEligibility(t *tes
 
 	knowledgeOnly := offline
 	knowledgeOnly.Package.PackageID = "knowledge-agent"
+	knowledgeOnly = finalizeResearchPreflightPackageFacts(t, knowledgeOnly)
 	candidates, _ = RankResearchPreflightCandidates(ResearchPreflightRequest{
 		Mode: ResearchModeAuto, Question: "compare evidence", RequestedSources: []string{ResearchSourceKnowledge},
 	}, []ResearchPreflightPackageFacts{knowledgeOnly})
@@ -421,12 +449,15 @@ func TestRankResearchPreflightCandidatesReadinessDoesNotChangeEligibility(t *tes
 func TestRankResearchPreflightCandidatesUsesStableTieBreakAndLimit(t *testing.T) {
 	alphaV2 := testResearchPreflightPackageFacts(t, "alpha-agent")
 	alphaV2.Package.Version = "2.0.0"
-	alphaV2.Package.ContentHash = "sha256:bbbb"
+	alphaV2 = finalizeResearchPreflightPackageFacts(t, alphaV2)
 	alphaV1HashB := testResearchPreflightPackageFacts(t, "Alpha-Agent")
 	alphaV1HashB.Package.Version = "1.0.0"
-	alphaV1HashB.Package.ContentHash = "sha256:bbbb"
-	alphaV1HashA := alphaV1HashB
-	alphaV1HashA.Package.ContentHash = "sha256:aaaa"
+	alphaV1HashB.Package.ModelPolicy.TimeoutMS++
+	alphaV1HashB = finalizeResearchPreflightPackageFacts(t, alphaV1HashB)
+	alphaV1HashA := testResearchPreflightPackageFacts(t, "Alpha-Agent")
+	alphaV1HashA.Package.Version = "1.0.0"
+	alphaV1HashA.Package.ModelPolicy.TimeoutMS += 2
+	alphaV1HashA = finalizeResearchPreflightPackageFacts(t, alphaV1HashA)
 	beta := testResearchPreflightPackageFacts(t, "beta-agent")
 	gamma := testResearchPreflightPackageFacts(t, "gamma-agent")
 
@@ -442,10 +473,12 @@ func TestRankResearchPreflightCandidatesUsesStableTieBreakAndLimit(t *testing.T)
 			t.Fatalf("unstable ordering: %#v versus %#v", first, second)
 		}
 	}
+	alphaV1Hashes := []string{alphaV1HashA.Package.ContentHash, alphaV1HashB.Package.ContentHash}
+	sort.Strings(alphaV1Hashes)
 	want := []struct{ id, version, hash string }{
-		{"Alpha-Agent", "1.0.0", "sha256:aaaa"},
-		{"Alpha-Agent", "1.0.0", "sha256:bbbb"},
-		{"alpha-agent", "2.0.0", "sha256:bbbb"},
+		{"Alpha-Agent", "1.0.0", alphaV1Hashes[0]},
+		{"Alpha-Agent", "1.0.0", alphaV1Hashes[1]},
+		{"alpha-agent", "2.0.0", alphaV2.Package.ContentHash},
 	}
 	for index, expected := range want {
 		if first[index].PackageID != expected.id || first[index].PackageVersion != expected.version || first[index].ContentHash != expected.hash {
@@ -487,8 +520,19 @@ func testResearchPreflightPackageFacts(t *testing.T, packageID string) ResearchP
 		t.Fatal(err)
 	}
 	return ResearchPreflightPackageFacts{
-		Package: finalized, EvaluationPassed: true, WorkerState: SourceAgentObservedOnline, BudgetFits: true,
+		Package: finalized, RunnablePackageValidated: true, EvaluationPassed: true,
+		WorkerState: SourceAgentObservedOnline, BudgetFits: true,
 	}
+}
+
+func finalizeResearchPreflightPackageFacts(t *testing.T, facts ResearchPreflightPackageFacts) ResearchPreflightPackageFacts {
+	t.Helper()
+	finalized, err := FinalizeAgentPackage(facts.Package)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts.Package = finalized
+	return facts
 }
 
 func researchPreflightGapCodes(gaps []ResearchPreflightGap) map[string]bool {

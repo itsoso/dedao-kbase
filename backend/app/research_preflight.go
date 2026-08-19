@@ -77,16 +77,18 @@ type ResearchPreflightGap struct {
 }
 
 // ResearchPreflightPackageFacts contains precomputed, bounded signals for the
-// pure recommendation ranker. EvaluationPassed must only be set after the
-// trusted package evaluation gate has succeeded.
+// pure recommendation ranker. RunnablePackageValidated and EvaluationPassed
+// must only be set by trusted upstream package and evaluation gates; neither
+// value may be accepted from a request.
 type ResearchPreflightPackageFacts struct {
-	Package           AgentPackage
-	TopicHits         int
-	EvidenceHits      int
-	LatestPublishedAt string
-	EvaluationPassed  bool
-	WorkerState       string
-	BudgetFits        bool
+	Package                  AgentPackage
+	TopicHits                int
+	EvidenceHits             int
+	LatestPublishedAt        string
+	RunnablePackageValidated bool
+	EvaluationPassed         bool
+	WorkerState              string
+	BudgetFits               bool
 }
 
 type researchPreflightRankedCandidate struct {
@@ -406,9 +408,13 @@ func RankResearchPreflightCandidates(
 
 func researchPreflightPackageEligible(request ResearchPreflightRequest, facts ResearchPreflightPackageFacts) bool {
 	pkg := facts.Package
-	if pkg.LifecycleState != AgentPackagePublished || !facts.EvaluationPassed ||
+	if pkg.LifecycleState != AgentPackagePublished || !facts.RunnablePackageValidated || !facts.EvaluationPassed ||
 		strings.TrimSpace(pkg.PackageID) == "" || strings.TrimSpace(pkg.Version) == "" ||
 		strings.TrimSpace(pkg.ContentHash) == "" || !agentPackageIDPattern.MatchString(pkg.PackageID) {
+		return false
+	}
+	wantContentHash, err := AgentPackageContentHash(pkg)
+	if err != nil || pkg.ContentHash != wantContentHash {
 		return false
 	}
 	if err := validateResearchAgentPackageScope(pkg, request.Mode, request.RequestedSources); err != nil {
