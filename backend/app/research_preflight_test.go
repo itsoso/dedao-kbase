@@ -273,6 +273,232 @@ func TestResearchPreflightInternalProjectionPreservesContentHash(t *testing.T) {
 	}
 }
 
+func TestResearchPreflightEligibility(t *testing.T) {
+	request := ResearchPreflightRequest{
+		Mode:             ResearchModeDeep,
+		Question:         "compare evidence",
+		RequestedSources: []string{ResearchSourceKnowledge, ResearchSourceChatlog},
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ResearchPreflightPackageFacts)
+		want   int
+	}{
+		{name: "published v4 research package with trusted evaluation", want: 1},
+		{name: "draft package rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.LifecycleState = AgentPackageDraft
+		}},
+		{name: "legacy schema rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.SchemaVersion = AgentPackageSchemaVersionV3
+			facts.Package.ResearchPolicy = nil
+		}},
+		{name: "missing research policy rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.ResearchPolicy = nil
+		}},
+		{name: "untrusted evaluation rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.EvaluationPassed = false
+		}},
+		{name: "mode outside policy rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.ResearchPolicy.Modes = []string{ResearchModeQuick}
+		}},
+		{name: "source outside policy rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.ResearchPolicy.AllowedSources = []string{ResearchSourceKnowledge}
+		}},
+		{name: "missing search capability rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.UIManifest.Capabilities = []string{"reader", "deep_research"}
+		}},
+		{name: "missing deep research capability rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.Package.UIManifest.Capabilities = []string{"reader", "search"}
+		}},
+		{name: "invalid research tool policy rejected", mutate: func(facts *ResearchPreflightPackageFacts) {
+			for index := range facts.Package.ToolPolicy.Tools {
+				if facts.Package.ToolPolicy.Tools[index].MCPServer == "research" {
+					facts.Package.ToolPolicy.Tools[index].Decision = AgentToolBlock
+					return
+				}
+			}
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			facts := testResearchPreflightPackageFacts(t, "eligible-agent")
+			if test.mutate != nil {
+				test.mutate(&facts)
+			}
+			candidates, _ := RankResearchPreflightCandidates(request, []ResearchPreflightPackageFacts{facts})
+			if len(candidates) != test.want {
+				t.Fatalf("candidate count = %d, want %d: %#v", len(candidates), test.want, candidates)
+			}
+		})
+	}
+}
+
+func TestResearchPreflightEligibilityExplicitConstraintNeverWidens(t *testing.T) {
+	eligible := testResearchPreflightPackageFacts(t, "eligible-agent")
+	ineligible := testResearchPreflightPackageFacts(t, "constrained-agent")
+	ineligible.Package.LifecycleState = AgentPackageDraft
+
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeAuto, Question: "compare evidence", PackageConstraint: "constrained-agent",
+	}, []ResearchPreflightPackageFacts{eligible, ineligible})
+	if len(candidates) != 0 {
+		t.Fatalf("explicit constraint widened eligibility: %#v", candidates)
+	}
+
+	candidates, _ = RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeAuto, Question: "compare evidence", PackageConstraint: "eligible-agent",
+	}, []ResearchPreflightPackageFacts{eligible, testResearchPreflightPackageFacts(t, "other-agent")})
+	if len(candidates) != 1 || candidates[0].PackageID != "eligible-agent" {
+		t.Fatalf("explicit constraint did not narrow candidates: %#v", candidates)
+	}
+}
+
+func TestRankResearchPreflightCandidatesEvidenceCoverageOutranksMetadata(t *testing.T) {
+	metadata := testResearchPreflightPackageFacts(t, "metadata-agent")
+	metadata.TopicHits = 20
+	metadata.EvidenceHits = 0
+	evidence := testResearchPreflightPackageFacts(t, "evidence-agent")
+	evidence.TopicHits = 0
+	evidence.EvidenceHits = 1
+
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeAuto, Question: "compare evidence",
+	}, []ResearchPreflightPackageFacts{metadata, evidence})
+	if len(candidates) != 2 || candidates[0].PackageID != "evidence-agent" {
+		t.Fatalf("ranked candidates = %#v", candidates)
+	}
+	if candidates[0].MatchLevel != ResearchPreflightMatchHigh || candidates[1].MatchLevel != ResearchPreflightMatchMedium {
+		t.Fatalf("match levels = %#v", candidates)
+	}
+}
+
+func TestRankResearchPreflightCandidatesReadinessDoesNotChangeEligibility(t *testing.T) {
+	online := testResearchPreflightPackageFacts(t, "online-agent")
+	online.WorkerState = SourceAgentObservedOnline
+	degraded := testResearchPreflightPackageFacts(t, "degraded-agent")
+	degraded.WorkerState = SourceAgentObservedDegraded
+	offline := testResearchPreflightPackageFacts(t, "offline-agent")
+	offline.WorkerState = SourceAgentObservedOffline
+	budgetBlocked := testResearchPreflightPackageFacts(t, "budget-agent")
+	budgetBlocked.BudgetFits = false
+
+	candidates, gaps := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeDeep, Question: "compare evidence", RequestedSources: []string{ResearchSourceChatlog},
+	}, []ResearchPreflightPackageFacts{offline, online, budgetBlocked, degraded})
+	if len(candidates) != 3 {
+		t.Fatalf("readiness filtered policy-eligible candidates: %#v", candidates)
+	}
+	readiness := map[string]string{}
+	reasons := map[string][]string{}
+	for _, candidate := range candidates {
+		readiness[candidate.PackageID] = candidate.Readiness
+		reasons[candidate.PackageID] = candidate.ReasonCodes
+	}
+	if readiness["online-agent"] != ResearchPreflightCheckPass ||
+		readiness["degraded-agent"] != ResearchPreflightCheckWarning ||
+		readiness["budget-agent"] != ResearchPreflightCheckBlocked {
+		t.Fatalf("candidate readiness = %#v", readiness)
+	}
+	if !containsResearchString(reasons["online-agent"], "worker_ready") || containsResearchString(reasons["degraded-agent"], "worker_ready") {
+		t.Fatalf("worker reasons = %#v", reasons)
+	}
+	if !researchPreflightGapCodes(gaps)["worker_offline"] || !researchPreflightGapCodes(gaps)["budget_insufficient"] {
+		t.Fatalf("readiness gaps = %#v", gaps)
+	}
+
+	knowledgeOnly := offline
+	knowledgeOnly.Package.PackageID = "knowledge-agent"
+	candidates, _ = RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeAuto, Question: "compare evidence", RequestedSources: []string{ResearchSourceKnowledge},
+	}, []ResearchPreflightPackageFacts{knowledgeOnly})
+	if len(candidates) != 1 || candidates[0].Readiness != ResearchPreflightCheckPass {
+		t.Fatalf("knowledge-only readiness depended on Worker: %#v", candidates)
+	}
+}
+
+func TestRankResearchPreflightCandidatesUsesStableTieBreakAndLimit(t *testing.T) {
+	alphaV2 := testResearchPreflightPackageFacts(t, "alpha-agent")
+	alphaV2.Package.Version = "2.0.0"
+	alphaV2.Package.ContentHash = "sha256:bbbb"
+	alphaV1HashB := testResearchPreflightPackageFacts(t, "Alpha-Agent")
+	alphaV1HashB.Package.Version = "1.0.0"
+	alphaV1HashB.Package.ContentHash = "sha256:bbbb"
+	alphaV1HashA := alphaV1HashB
+	alphaV1HashA.Package.ContentHash = "sha256:aaaa"
+	beta := testResearchPreflightPackageFacts(t, "beta-agent")
+	gamma := testResearchPreflightPackageFacts(t, "gamma-agent")
+
+	facts := []ResearchPreflightPackageFacts{gamma, alphaV2, beta, alphaV1HashB, alphaV1HashA}
+	request := ResearchPreflightRequest{Mode: ResearchModeAuto, Question: "compare evidence"}
+	first, _ := RankResearchPreflightCandidates(request, facts)
+	second, _ := RankResearchPreflightCandidates(request, []ResearchPreflightPackageFacts{beta, alphaV1HashA, gamma, alphaV1HashB, alphaV2})
+	if len(first) != researchPreflightCandidateMax || len(second) != researchPreflightCandidateMax {
+		t.Fatalf("candidate limit = %d and %d", len(first), len(second))
+	}
+	for index := range first {
+		if first[index].PackageID != second[index].PackageID || first[index].PackageVersion != second[index].PackageVersion || first[index].ContentHash != second[index].ContentHash {
+			t.Fatalf("unstable ordering: %#v versus %#v", first, second)
+		}
+	}
+	want := []struct{ id, version, hash string }{
+		{"Alpha-Agent", "1.0.0", "sha256:aaaa"},
+		{"Alpha-Agent", "1.0.0", "sha256:bbbb"},
+		{"alpha-agent", "2.0.0", "sha256:bbbb"},
+	}
+	for index, expected := range want {
+		if first[index].PackageID != expected.id || first[index].PackageVersion != expected.version || first[index].ContentHash != expected.hash {
+			t.Fatalf("candidate %d = %#v, want %#v", index, first[index], expected)
+		}
+	}
+}
+
+func TestRankResearchPreflightCandidatesUsesStableReasonCodesOnly(t *testing.T) {
+	facts := testResearchPreflightPackageFacts(t, "reason-agent")
+	facts.TopicHits = 2
+	facts.EvidenceHits = 3
+	facts.LatestPublishedAt = "2026-08-18T12:00:00Z"
+	facts.WorkerState = SourceAgentObservedOnline
+
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeAuto, Question: "compare evidence", RequestedSources: []string{ResearchSourceChatlog},
+	}, []ResearchPreflightPackageFacts{facts})
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	want := []string{"evidence_coverage", "topic_match", "fresh_release", "trusted_evaluation", "worker_ready"}
+	if strings.Join(candidates[0].ReasonCodes, ",") != strings.Join(want, ",") {
+		t.Fatalf("reason codes = %#v, want %#v", candidates[0].ReasonCodes, want)
+	}
+	if candidates[0].DisplayName != "reason-agent" || candidates[0].EvaluationStatus != "passed" {
+		t.Fatalf("candidate safe summary = %#v", candidates[0])
+	}
+}
+
+func testResearchPreflightPackageFacts(t *testing.T, packageID string) ResearchPreflightPackageFacts {
+	t.Helper()
+	pkg := validAgentPackageV4()
+	pkg.PackageID = packageID
+	pkg.LifecycleState = AgentPackagePublished
+	pkg.PublishedAt = "2026-08-17T12:00:00Z"
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ResearchPreflightPackageFacts{
+		Package: finalized, EvaluationPassed: true, WorkerState: SourceAgentObservedOnline, BudgetFits: true,
+	}
+}
+
+func researchPreflightGapCodes(gaps []ResearchPreflightGap) map[string]bool {
+	codes := make(map[string]bool, len(gaps))
+	for _, gap := range gaps {
+		codes[gap.Code] = true
+	}
+	return codes
+}
+
 func testResearchPreflight() ResearchPreflight {
 	return ResearchPreflight{
 		PreflightID: "research-preflight-a",
