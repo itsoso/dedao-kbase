@@ -161,6 +161,7 @@ const defaultKnowledgeCollectionMaxBodyBytes int64 = 16 << 10
 const defaultDedaoEbookVerificationTimeout = 15 * time.Second
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
+	researchKnowledgeConfigured := cfg.Store != nil
 	store := cfg.Store
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
@@ -263,10 +264,12 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	var researchPreflight *ResearchPreflightService
 	if cfg.ResearchStore != nil {
 		researchHTTPInitErr = migrateResearchHTTP(cfg.ResearchStore.db)
-		researchPreflight = &ResearchPreflightService{
-			Knowledge: store, Research: cfg.ResearchStore, SourceSync: cfg.SourceSync,
-			QuickBudget: researchQuickBudget, DeepBudget: researchDeepBudget,
-			Now: cfg.ResearchStore.now,
+		if researchKnowledgeConfigured && researchHTTPInitErr == nil {
+			researchPreflight = &ResearchPreflightService{
+				Knowledge: store, Research: cfg.ResearchStore, SourceSync: cfg.SourceSync,
+				QuickBudget: researchQuickBudget, DeepBudget: researchDeepBudget,
+				Now: cfg.ResearchStore.now,
+			}
 		}
 	}
 	return &kbaseHTTPHandler{

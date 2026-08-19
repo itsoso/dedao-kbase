@@ -141,31 +141,35 @@ type PublicResearchPreflightResult struct {
 }
 
 type PublicResearchPreflightCandidate struct {
-	PackageID        string                    `json:"package_id"`
-	PackageVersion   string                    `json:"package_version"`
-	DisplayName      string                    `json:"display_name,omitempty"`
-	MatchLevel       string                    `json:"match_level"`
-	ReasonCodes      []string                  `json:"reason_codes,omitempty"`
-	KnowledgeScope   []string                  `json:"knowledge_scope,omitempty"`
-	UpdatedAt        string                    `json:"updated_at,omitempty"`
-	EvaluationStatus string                    `json:"evaluation_status,omitempty"`
-	SupportedSources []string                  `json:"supported_sources,omitempty"`
-	Readiness        string                    `json:"readiness"`
-	Coverage         ResearchPreflightCoverage `json:"coverage"`
-	Budget           ResearchPreflightBudget   `json:"budget"`
+	PackageID        string                          `json:"package_id"`
+	PackageVersion   string                          `json:"package_version"`
+	DisplayName      string                          `json:"display_name,omitempty"`
+	MatchLevel       string                          `json:"match_level"`
+	ReasonCodes      []string                        `json:"reason_codes,omitempty"`
+	KnowledgeScope   []string                        `json:"knowledge_scope,omitempty"`
+	UpdatedAt        string                          `json:"updated_at,omitempty"`
+	EvaluationStatus string                          `json:"evaluation_status,omitempty"`
+	SupportedSources []string                        `json:"supported_sources,omitempty"`
+	Readiness        string                          `json:"readiness"`
+	Coverage         PublicResearchPreflightCoverage `json:"coverage"`
+	Budget           ResearchPreflightBudget         `json:"budget"`
+}
+
+type PublicResearchPreflightCoverage struct {
+	EvidenceCount int `json:"evidence_count"`
+	ReleaseCount  int `json:"release_count"`
+	CitationCount int `json:"citation_count"`
 }
 
 type PublicResearchPreflightCheck struct {
 	Code       string `json:"code"`
 	Status     string `json:"status"`
 	ResultCode string `json:"result_code,omitempty"`
-	Message    string `json:"message,omitempty"`
 	NextAction string `json:"next_action,omitempty"`
 }
 
 type PublicResearchPreflightGap struct {
 	Code       string `json:"code"`
-	Message    string `json:"message,omitempty"`
 	NextAction string `json:"next_action,omitempty"`
 }
 
@@ -192,9 +196,11 @@ func NormalizeResearchPreflightRequest(request ResearchPreflightRequest) (Resear
 	if len([]rune(request.PackageConstraint)) > researchPackageIDMaxRunes {
 		return ResearchPreflightRequest{}, fmt.Errorf("package_constraint exceeds %d characters", researchPackageIDMaxRunes)
 	}
-	request.ParentRunID = strings.TrimSpace(request.ParentRunID)
 	if len([]rune(request.ParentRunID)) > researchPackageIDMaxRunes {
 		return ResearchPreflightRequest{}, fmt.Errorf("parent_run_id exceeds %d characters", researchPackageIDMaxRunes)
+	}
+	if request.ParentRunID != "" && !validResearchPreflightResourceID(request.ParentRunID) {
+		return ResearchPreflightRequest{}, fmt.Errorf("parent_run_id must be a canonical Research resource ID")
 	}
 
 	if len(request.RequestedSources) > researchRequestedSourcesMax {
@@ -228,6 +234,10 @@ func ValidateResearchPreflight(preflight ResearchPreflight) error {
 	case ResearchPreflightStatusReady, ResearchPreflightStatusBlocked:
 	default:
 		return fmt.Errorf("unsupported preflight status %q", preflight.Status)
+	}
+	if preflight.ParentRunID != "" &&
+		(len([]rune(preflight.ParentRunID)) > researchPackageIDMaxRunes || !validResearchPreflightResourceID(preflight.ParentRunID)) {
+		return fmt.Errorf("parent_run_id must be a canonical bounded Research resource ID")
 	}
 	if len(preflight.Candidates) > researchPreflightCandidateMax {
 		return fmt.Errorf("candidates exceeds %d items", researchPreflightCandidateMax)
@@ -292,7 +302,7 @@ func PublicResearchPreflight(preflight ResearchPreflight) PublicResearchPrefligh
 		Candidates:  make([]PublicResearchPreflightCandidate, 0, len(preflight.Candidates)),
 		Checks:      make([]PublicResearchPreflightCheck, 0, len(preflight.Checks)),
 		Gaps:        make([]PublicResearchPreflightGap, 0, len(preflight.Gaps)),
-		ParentRunID: preflight.ParentRunID,
+		ParentRunID: publicResearchPreflightParentRunID(preflight.ParentRunID),
 		CreatedAt:   preflight.CreatedAt,
 		ExpiresAt:   preflight.ExpiresAt,
 	}
@@ -308,11 +318,10 @@ func PublicResearchPreflight(preflight ResearchPreflight) PublicResearchPrefligh
 			EvaluationStatus: candidate.EvaluationStatus,
 			SupportedSources: append([]string(nil), candidate.SupportedSources...),
 			Readiness:        candidate.Readiness,
-			Coverage: ResearchPreflightCoverage{
+			Coverage: PublicResearchPreflightCoverage{
 				EvidenceCount: candidate.Coverage.EvidenceCount,
 				ReleaseCount:  candidate.Coverage.ReleaseCount,
 				CitationCount: candidate.Coverage.CitationCount,
-				ReleaseIDs:    append([]string(nil), candidate.Coverage.ReleaseIDs...),
 			},
 			Budget: candidate.Budget,
 		})
@@ -322,18 +331,37 @@ func PublicResearchPreflight(preflight ResearchPreflight) PublicResearchPrefligh
 			Code:       check.Code,
 			Status:     check.Status,
 			ResultCode: check.ResultCode,
-			Message:    check.Message,
 			NextAction: check.NextAction,
 		})
 	}
 	for _, gap := range preflight.Gaps {
 		public.Gaps = append(public.Gaps, PublicResearchPreflightGap{
 			Code:       gap.Code,
-			Message:    gap.Message,
 			NextAction: gap.NextAction,
 		})
 	}
 	return public
+}
+
+func validResearchPreflightResourceID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func publicResearchPreflightParentRunID(value string) string {
+	if len([]rune(value)) > researchPackageIDMaxRunes || !validResearchPreflightResourceID(value) {
+		return ""
+	}
+	return value
 }
 
 // RankResearchPreflightCandidates filters policy eligibility and ranks only

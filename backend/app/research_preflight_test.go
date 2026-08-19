@@ -15,7 +15,7 @@ func TestValidateResearchPreflightRequestNormalizesBoundedScope(t *testing.T) {
 		Question:          "  compare evidence  ",
 		RequestedSources:  []string{"knowledge", "chatlog"},
 		PackageConstraint: "  collection-agent  ",
-		ParentRunID:       "  research-run-parent  ",
+		ParentRunID:       "research-run-parent_1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -23,7 +23,7 @@ func TestValidateResearchPreflightRequestNormalizesBoundedScope(t *testing.T) {
 	if request.Question != "compare evidence" || request.Mode != ResearchModeAuto {
 		t.Fatalf("normalized request = %#v", request)
 	}
-	if request.PackageConstraint != "collection-agent" || request.ParentRunID != "research-run-parent" {
+	if request.PackageConstraint != "collection-agent" || request.ParentRunID != "research-run-parent_1" {
 		t.Fatalf("normalized optional scope = %#v", request)
 	}
 }
@@ -110,6 +110,16 @@ func TestValidateResearchPreflightRequestRejectsHardBounds(t *testing.T) {
 }
 
 func TestValidateResearchPreflightRequestEnforcesParentRunIDBoundary(t *testing.T) {
+	t.Run("valid opaque resource id allowed", func(t *testing.T) {
+		request, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+			Question:    "compare evidence",
+			ParentRunID: "research-run-parent_1",
+		})
+		if err != nil || request.ParentRunID != "research-run-parent_1" {
+			t.Fatalf("request = %#v, %v", request, err)
+		}
+	})
+
 	t.Run("exact maximum allowed", func(t *testing.T) {
 		parentRunID := strings.Repeat("r", researchPackageIDMaxRunes)
 		request, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
@@ -133,6 +143,29 @@ func TestValidateResearchPreflightRequestEnforcesParentRunIDBoundary(t *testing.
 			t.Fatalf("error = %v", err)
 		}
 	})
+
+	for _, parentRunID := range []string{
+		"/tmp/private-run", "../parent", "research run", "research:run",
+		"research\nrun", "研究-run", " research-run", "research-run ", " ",
+	} {
+		t.Run("invalid "+strings.ReplaceAll(parentRunID, "\n", "newline"), func(t *testing.T) {
+			_, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+				Question:    "compare evidence",
+				ParentRunID: parentRunID,
+			})
+			if err == nil || !strings.Contains(err.Error(), "parent_run_id") {
+				t.Fatalf("parent_run_id %q error = %v", parentRunID, err)
+			}
+		})
+	}
+}
+
+func TestValidateResearchPreflightRejectsInvalidParentRunID(t *testing.T) {
+	preflight := testResearchPreflight()
+	preflight.ParentRunID = "../private-parent"
+	if err := ValidateResearchPreflight(preflight); err == nil || !strings.Contains(err.Error(), "parent_run_id") {
+		t.Fatalf("error = %v", err)
+	}
 }
 
 func TestValidateResearchPreflightRejectsMoreThanThreeCandidates(t *testing.T) {
@@ -251,16 +284,47 @@ func TestValidateResearchPreflightAllowsApprovedBlockedAndWarningShapes(t *testi
 }
 
 func TestResearchPreflightProjectionContainsNoPrivateBodies(t *testing.T) {
-	encoded, err := json.Marshal(PublicResearchPreflight(testResearchPreflight()))
+	preflight := testResearchPreflight()
+	preflight.Candidates[0].Coverage = ResearchPreflightCoverage{
+		EvidenceCount: 7, ReleaseCount: 1, CitationCount: 3,
+		ReleaseIDs: []string{"release-private-locator"},
+	}
+	preflight.Checks[0].Message = "private free-form check message"
+	preflight.Gaps[0].Message = "private free-form gap message"
+	encoded, err := json.Marshal(PublicResearchPreflight(preflight))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, forbidden := range []string{
 		"content_excerpt", "message_ref", "local_path", "identity_id",
 		"request_hash", "content_hash", "private-request-hash", "private-content-hash",
+		"release_ids", "release-private-locator", "private free-form check message",
+		"private free-form gap message", `"message"`,
 	} {
 		if bytes.Contains(encoded, []byte(forbidden)) {
 			t.Fatalf("projection leaks %s", forbidden)
+		}
+	}
+	for _, count := range []string{`"evidence_count":7`, `"release_count":1`, `"citation_count":3`} {
+		if !bytes.Contains(encoded, []byte(count)) {
+			t.Fatalf("projection lost public count %s: %s", count, encoded)
+		}
+	}
+	if !bytes.Contains(encoded, []byte(`"parent_run_id":"research-run-parent"`)) {
+		t.Fatalf("projection lost valid parent run id: %s", encoded)
+	}
+}
+
+func TestResearchPreflightProjectionOmitsInvalidParentRunID(t *testing.T) {
+	preflight := testResearchPreflight()
+	preflight.ParentRunID = "/tmp/private-parent-run"
+	encoded, err := json.Marshal(PublicResearchPreflight(preflight))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"parent_run_id", "/tmp/private-parent-run"} {
+		if bytes.Contains(encoded, []byte(forbidden)) {
+			t.Fatalf("projection leaks invalid parent %q: %s", forbidden, encoded)
 		}
 	}
 }

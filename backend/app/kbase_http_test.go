@@ -2867,7 +2867,8 @@ func TestKBaseHTTPResearchPreflightBearerReadyAndRedaction(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"private-http-preflight-evidence", "citation-http-ready", "content_hash", "request_hash",
-		"message_ref", "local_path", "identity_id", research.dbPath, knowledge.Root(),
+		"message_ref", "local_path", "identity_id", "release_ids", "release-http-ready",
+		`"message"`, research.dbPath, knowledge.Root(),
 	} {
 		if forbidden != "" && strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("preflight response leaked %q: %s", forbidden, response.Body.String())
@@ -2899,6 +2900,18 @@ func TestKBaseHTTPResearchPreflightBrowserSessionCSRFAndOwnerIsolation(t *testin
 	handler.ServeHTTP(missingResponse, missingCSRF)
 	if missingResponse.Code != http.StatusForbidden {
 		t.Fatalf("missing CSRF status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
+	}
+	unconfigured := researchPreflightHTTPTestConfig(nil, research, nil)
+	unconfigured.BrowserSessionSecret = testBrowserSessionSecret
+	unconfigured.BrowserSessions = config.BrowserSessions
+	unconfiguredHandler := NewKBaseHTTPHandler(unconfigured)
+	unconfiguredMissingCSRF := newKBaseBrowserCookieRequest(
+		http.MethodPost, "/api/research/preflight", first.Token, body,
+	)
+	unconfiguredMissingResponse := httptest.NewRecorder()
+	unconfiguredHandler.ServeHTTP(unconfiguredMissingResponse, unconfiguredMissingCSRF)
+	if unconfiguredMissingResponse.Code != http.StatusForbidden {
+		t.Fatalf("unconfigured missing CSRF status=%d body=%s", unconfiguredMissingResponse.Code, unconfiguredMissingResponse.Body.String())
 	}
 
 	create := func(credentials BrowserSessionCredentials, csrf string) PublicResearchPreflightResult {
@@ -2977,6 +2990,7 @@ func TestKBaseHTTPResearchPreflightValidationMethodsAndDependencyUnavailable(t *
 		{name: "oversized", method: http.MethodPost, body: `{"mode":"quick","question":"` + strings.Repeat("x", int(defaultResearchRunHTTPMaxBodyBytes)+1024) + `"}`, want: http.StatusRequestEntityTooLarge, wantError: "request body too large"},
 		{name: "bad mode", method: http.MethodPost, body: `{"mode":"private-mode","question":"one"}`, want: http.StatusBadRequest, wantError: "invalid_research_preflight_request"},
 		{name: "bad source", method: http.MethodPost, body: `{"mode":"quick","question":"one","requested_sources":["private-source"]}`, want: http.StatusBadRequest, wantError: "invalid_research_preflight_request"},
+		{name: "path parent", method: http.MethodPost, body: `{"mode":"quick","question":"one","parent_run_id":"/tmp/private-parent"}`, want: http.StatusBadRequest, wantError: "invalid_research_preflight_request"},
 		{name: "method", method: http.MethodGet, want: http.StatusMethodNotAllowed, wantError: "method_not_allowed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -2984,7 +2998,7 @@ func TestKBaseHTTPResearchPreflightValidationMethodsAndDependencyUnavailable(t *
 			if response.Code != test.want || response.Body.String() != fmt.Sprintf("{\"error\":%q}\n", test.wantError) {
 				t.Fatalf("status=%d body=%s want=%d/%q", response.Code, response.Body.String(), test.want, test.wantError)
 			}
-			for _, private := range []string{"secret", "private-mode", "private-source", research.dbPath} {
+			for _, private := range []string{"secret", "private-mode", "private-source", "/tmp/private-parent", research.dbPath} {
 				if strings.Contains(response.Body.String(), private) {
 					t.Fatalf("error leaked %q: %s", private, response.Body.String())
 				}
@@ -3012,6 +3026,35 @@ func TestKBaseHTTPResearchPreflightValidationMethodsAndDependencyUnavailable(t *
 		if private != "" && strings.Contains(unavailable.Body.String(), private) {
 			t.Fatalf("unavailable response leaked %q: %s", private, unavailable.Body.String())
 		}
+	}
+}
+
+func TestKBaseHTTPResearchPreflightNilKnowledgeStoreFailsClosedAfterAuthentication(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	defaultRoot := t.TempDir()
+	t.Setenv("DEDAO_BOOK_KNOWLEDGE_ROOT", defaultRoot)
+	defaultKnowledge := NewBookKnowledgeStore(defaultRoot)
+	publishResearchPreflightServicePackage(
+		t, defaultKnowledge, "default-root-agent", "release-default-root", "citation-default-root",
+		"default root evidence must not be probed", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, t.TempDir(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(nil, research, nil))
+	body := `{"mode":"quick","question":"default root evidence must not be probed","requested_sources":["knowledge"]}`
+
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		response := requestJSONKBase(handler, method, "/api/research/preflight", "", body)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated %s status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+	response := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret", body)
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"error\":\"research_preflight_unavailable\"}\n" {
+		t.Fatalf("nil Store status=%d body=%s", response.Code, response.Body.String())
+	}
+	var persisted int
+	if err := research.db.QueryRow(`SELECT COUNT(*) FROM research_preflights`).Scan(&persisted); err != nil || persisted != 0 {
+		t.Fatalf("nil Store persisted preflights=%d, %v", persisted, err)
 	}
 }
 
