@@ -177,12 +177,20 @@ curl --fail --silent --show-error \
   "$kbase_url/api/agent-packages/publish" >"$smoke_root/collection-published.json"
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["package"]["schema_version"]=="agent-package.v4"' "$smoke_root/collection-published.json"
 
+quick_preflight_response="$smoke_root/quick-preflight.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  --data "{\"mode\":\"quick\",\"question\":\"What does the synthetic collection evidence support?\",\"requested_sources\":[\"knowledge\"],\"package_constraint\":\"$collection_package_id\"}" \
+  "$kbase_url/api/research/preflight" >"$quick_preflight_response"
+quick_preflight_id="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); expected=(sys.argv[2],sys.argv[3]); candidates={(item["package_id"],item["package_version"]):item for item in value["candidates"]}; assert value["status"]=="ready" and expected in candidates and candidates[expected]["readiness"] in ("pass","warning"); print(value["preflight_id"])' "$quick_preflight_response" "$collection_package_id" "$collection_package_version")"
+
 quick_response="$smoke_root/quick-run.json"
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $auth_token" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: materialized-collection-quick-smoke' \
-  --data "{\"mode\":\"quick\",\"question\":\"What does the synthetic collection evidence support?\",\"package_id\":\"$collection_package_id\",\"package_version\":\"$collection_package_version\",\"requested_sources\":[\"knowledge\"]}" \
+  --data "{\"preflight_id\":\"$quick_preflight_id\",\"mode\":\"quick\",\"question\":\"What does the synthetic collection evidence support?\",\"package_id\":\"$collection_package_id\",\"package_version\":\"$collection_package_version\",\"requested_sources\":[\"knowledge\"]}" \
   "$kbase_url/api/research/runs" >"$quick_response"
 quick_run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["run_id"])' "$quick_response")"
 quick_detail="$smoke_root/quick-detail.json"
@@ -211,12 +219,28 @@ tools = [row[0] for row in connection.execute(
 assert "search_knowledge" in tools and "fetch_knowledge_evidence" in tools, tools
 PY
 
+env \
+  KBASE_REMOTE_URL="$kbase_url" \
+  KBASE_SOURCE_AGENT_TOKEN="$source_token" \
+  KBASE_SOURCE_AGENT_ID=chatlog-agent \
+  CHATLOG_AGENT_STATE_DIR="$state_root" \
+  CHATLOG_BASE_URL="$fixture_url" \
+  "$smoke_root/chatlog-agent" once >"$smoke_root/worker-heartbeat.json" 2>"$smoke_root/worker.err"
+
+deep_preflight_response="$smoke_root/deep-preflight.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"requested_sources\":[\"chatlog\"],\"package_constraint\":\"$research_package_id\"}" \
+  "$kbase_url/api/research/preflight" >"$deep_preflight_response"
+deep_preflight_id="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); expected=(sys.argv[2],sys.argv[3]); candidates={(item["package_id"],item["package_version"]):item for item in value["candidates"]}; assert value["status"]=="ready" and expected in candidates and candidates[expected]["readiness"] in ("pass","warning"); print(value["preflight_id"])' "$deep_preflight_response" "$research_package_id" "$research_package_version")"
+
 run_response="$smoke_root/run.json"
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $auth_token" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: full-stack-smoke' \
-  --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"package_id\":\"$research_package_id\",\"package_version\":\"$research_package_version\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"]}" \
+  --data "{\"preflight_id\":\"$deep_preflight_id\",\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"package_id\":\"$research_package_id\",\"package_version\":\"$research_package_version\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"]}" \
   "$kbase_url/api/research/runs" >"$run_response"
 run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["run_id"])' "$run_response")"
 

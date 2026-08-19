@@ -93,9 +93,17 @@ func TestValidateResearchRunRequestRejectsUnknownSourceAndOversizedQuestion(t *t
 		want    string
 	}{
 		{
+			name: "non canonical preflight",
+			request: ResearchRunRequest{
+				Mode: ResearchModeAuto, Question: "question", PackageID: "research-agent", PackageVersion: "1.0.0",
+				PreflightID: "/private/preflight", RequestedSources: []string{ResearchSourceKnowledge},
+			},
+			want: "preflight_id",
+		},
+		{
 			name: "missing package scope",
 			request: ResearchRunRequest{
-				Mode: ResearchModeAuto, Question: "question",
+				Mode: ResearchModeAuto, Question: "question", PreflightID: "research-preflight-valid",
 				RequestedSources: []string{ResearchSourceKnowledge},
 			},
 			want: "package_id and package_version",
@@ -104,6 +112,7 @@ func TestValidateResearchRunRequestRejectsUnknownSourceAndOversizedQuestion(t *t
 			name: "unknown source",
 			request: ResearchRunRequest{
 				Mode: ResearchModeAuto, Question: "question", PackageID: "research-agent", PackageVersion: "1.0.0",
+				PreflightID:      "research-preflight-valid",
 				RequestedSources: []string{"private_database"},
 			},
 			want: "unsupported requested source",
@@ -112,6 +121,7 @@ func TestValidateResearchRunRequestRejectsUnknownSourceAndOversizedQuestion(t *t
 			name: "oversized question",
 			request: ResearchRunRequest{
 				Mode: ResearchModeAuto, Question: strings.Repeat("问", researchQuestionMaxRunes+1), PackageID: "research-agent", PackageVersion: "1.0.0",
+				PreflightID:      "research-preflight-valid",
 				RequestedSources: []string{ResearchSourceKnowledge},
 			},
 			want: "question exceeds",

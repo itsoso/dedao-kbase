@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,7 +80,12 @@ func OpenResearchStore(root string, now func() time.Time) (*ResearchStore, error
 		return nil, err
 	}
 	dbPath := filepath.Join(root, researchStoreDBName)
-	db, err := sql.Open("sqlite3", dbPath)
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     dbPath,
+		RawQuery: "_busy_timeout=5000&_foreign_keys=on&_txlock=immediate",
+	}).String()
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +114,8 @@ func migrateResearchStore(db *sql.DB) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS research_runs (
 			run_id TEXT PRIMARY KEY,
+			parent_run_id TEXT NOT NULL DEFAULT '',
+			preflight_id TEXT NOT NULL DEFAULT '',
 			idempotency_key TEXT NOT NULL UNIQUE,
 			request_hash TEXT NOT NULL,
 			schema_version TEXT NOT NULL,
@@ -230,7 +238,11 @@ func migrateResearchStore(db *sql.DB) error {
 			candidates_json TEXT NOT NULL,
 			checks_json TEXT NOT NULL,
 			gaps_json TEXT NOT NULL,
+			mode TEXT NOT NULL DEFAULT '',
+			requested_sources_json TEXT NOT NULL DEFAULT '[]',
+			package_constraint TEXT NOT NULL DEFAULT '',
 			parent_run_id TEXT NOT NULL DEFAULT '',
+			bound_run_id TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL
 		)`,
@@ -251,6 +263,24 @@ func migrateResearchStore(db *sql.DB) error {
 		return err
 	}
 	if err := ensureResearchStoreColumn(db, "research_runs", "lease_epoch", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_runs", "parent_run_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_runs", "preflight_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_preflights", "mode", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_preflights", "requested_sources_json", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_preflights", "package_constraint", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_preflights", "bound_run_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := ensureResearchStoreColumn(db, "research_model_invocations", "attempt", `INTEGER NOT NULL DEFAULT 0`); err != nil {
@@ -321,7 +351,8 @@ func (s *ResearchStore) CreateRun(input ResearchRunInput) (*ResearchRun, bool, e
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	run := &ResearchRun{
 		SchemaVersion: ResearchRunSchemaVersion, RunID: newResearchRunID(), Mode: input.Mode,
-		Question: strings.TrimSpace(input.Request.Question), Status: ResearchPlanning,
+		PreflightID: strings.TrimSpace(input.Request.PreflightID),
+		Question:    strings.TrimSpace(input.Request.Question), Status: ResearchPlanning,
 		PackageID: strings.TrimSpace(input.Request.PackageID), PackageVersion: strings.TrimSpace(input.Request.PackageVersion),
 		SubjectIDs:       append([]string(nil), input.Request.SubjectIDs...),
 		RequestedSources: append([]string(nil), input.Request.RequestedSources...),
@@ -333,12 +364,12 @@ func (s *ResearchStore) CreateRun(input ResearchRunInput) (*ResearchRun, bool, e
 		return nil, false, err
 	}
 	_, err = tx.Exec(`INSERT INTO research_runs (
-		run_id, idempotency_key, request_hash, schema_version, mode, question, status,
+		run_id, parent_run_id, preflight_id, idempotency_key, request_hash, schema_version, mode, question, status,
 		package_id, package_version, subject_ids_json, requested_sources_json, route_reasons_json,
 		actual_scope_json, budget_json, wait_reason, failure_json, version, created_at, updated_at,
 		lease_owner, lease_epoch, lease_expires_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		run.RunID, input.IdempotencyKey, requestHash, run.SchemaVersion, run.Mode, run.Question, run.Status,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.RunID, run.ParentRunID, run.PreflightID, input.IdempotencyKey, requestHash, run.SchemaVersion, run.Mode, run.Question, run.Status,
 		run.PackageID, run.PackageVersion, values.subjectIDs, values.requestedSources, values.routeReasons,
 		values.actualScope, values.budget, run.WaitReason, values.failure, run.Version, run.CreatedAt, run.UpdatedAt,
 		run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt)
@@ -818,11 +849,11 @@ type researchRowQuerier interface {
 func loadResearchRun(queryer researchRowQuerier, runID string) (*ResearchRun, error) {
 	var run ResearchRun
 	var subjectIDs, requestedSources, routeReasons, actualScope, budget, failure string
-	err := queryer.QueryRow(`SELECT schema_version, run_id, mode, question, status, package_id, package_version,
+	err := queryer.QueryRow(`SELECT schema_version, run_id, parent_run_id, preflight_id, mode, question, status, package_id, package_version,
 		subject_ids_json, requested_sources_json, route_reasons_json, actual_scope_json, budget_json,
 		wait_reason, failure_json, version, created_at, updated_at, lease_owner, lease_epoch, lease_expires_at
 		FROM research_runs WHERE run_id = ?`, runID).Scan(
-		&run.SchemaVersion, &run.RunID, &run.Mode, &run.Question, &run.Status, &run.PackageID, &run.PackageVersion,
+		&run.SchemaVersion, &run.RunID, &run.ParentRunID, &run.PreflightID, &run.Mode, &run.Question, &run.Status, &run.PackageID, &run.PackageVersion,
 		&subjectIDs, &requestedSources, &routeReasons, &actualScope, &budget,
 		&run.WaitReason, &failure, &run.Version, &run.CreatedAt, &run.UpdatedAt, &run.LeaseOwner, &run.LeaseEpoch, &run.LeaseExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {

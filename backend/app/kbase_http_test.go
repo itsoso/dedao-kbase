@@ -2519,8 +2519,12 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = researchStore.Close() })
+	sourceSync := openResearchPreflightSourceStore(t, time.Now())
+	if _, err := sourceSync.HeartbeatAgent(healthyResearchPreflightHeartbeat()); err != nil {
+		t.Fatal(err)
+	}
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store: knowledge, AuthToken: "admin-secret", ResearchStore: researchStore,
+		Store: knowledge, AuthToken: "admin-secret", ResearchStore: researchStore, SourceSync: sourceSync,
 		ResearchQuickBudget: ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1},
 		ResearchDeepBudget:  ResearchBudget{MaxIterations: 20, MaxEvidenceItems: 1000, MaxQuotedChars: 200000, MaxModelCalls: 32, MaxCostUSD: 100},
 	})
@@ -2557,13 +2561,22 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	legacyRequest.Header.Set("Idempotency-Key", "research-http-legacy")
 	legacyResponse := httptest.NewRecorder()
 	handler.ServeHTTP(legacyResponse, legacyRequest)
-	if legacyResponse.Code != http.StatusBadRequest || !strings.Contains(legacyResponse.Body.String(), "research_package_not_eligible") {
+	if legacyResponse.Code != http.StatusBadRequest || !strings.Contains(legacyResponse.Body.String(), "preflight_required") {
 		t.Fatalf("legacy package create status=%d body=%s", legacyResponse.Code, legacyResponse.Body.String())
 	}
 
+	preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret",
+		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"]}`)
+	if preflightResponse.Code != http.StatusCreated {
+		t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+	}
+	var preflight PublicResearchPreflightResult
+	if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+		t.Fatal(err)
+	}
 	body := fmt.Sprintf(
-		`{"mode":"auto","question":"比较去年与现在的建议","package_id":%q,"package_version":%q,"requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
-		pkg.PackageID, pkg.Version,
+		`{"preflight_id":%q,"mode":"auto","question":"比较去年与现在的建议","package_id":%q,"package_version":%q,"requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
+		preflight.PreflightID, pkg.PackageID, pkg.Version,
 	)
 	createRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
 	createRequest.Header.Set("Content-Type", "application/json")
@@ -2736,6 +2749,290 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	}
 }
 
+func TestKBaseHTTPResearchRunRequiresPreflightForBearerAndBrowser(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(
+		t, knowledge, "http-confirm-agent", "release-http-confirm", "citation-http-confirm",
+		"generic HTTP confirmation evidence", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	config := researchPreflightHTTPTestConfig(knowledge, research, nil)
+	handler := NewKBaseHTTPHandler(config)
+	runBody := fmt.Sprintf(
+		`{"mode":"quick","question":"generic HTTP confirmation evidence","package_id":%q,"package_version":%q,"requested_sources":["knowledge"]}`,
+		pkg.PackageID, pkg.Version,
+	)
+
+	missing := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(runBody))
+	missing.Header.Set("Authorization", "Bearer admin-secret")
+	missing.Header.Set("Content-Type", "application/json")
+	missing.Header.Set("Idempotency-Key", "bearer-missing-preflight")
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusBadRequest || missingResponse.Body.String() != "{\"error\":\"preflight_required\"}\n" {
+		t.Fatalf("bearer bypass status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
+	}
+	assertResearchRunCount(t, research, 0)
+
+	preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret",
+		`{"mode":"quick","question":"generic HTTP confirmation evidence","requested_sources":["knowledge"]}`)
+	if preflightResponse.Code != http.StatusCreated {
+		t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+	}
+	var preflight PublicResearchPreflightResult
+	if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+		t.Fatal(err)
+	}
+	confirmedBody := strings.TrimSuffix(runBody, "}") + fmt.Sprintf(`,"preflight_id":%q}`, preflight.PreflightID)
+	confirmed := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(confirmedBody))
+	confirmed.Header.Set("Authorization", "Bearer admin-secret")
+	confirmed.Header.Set("Content-Type", "application/json")
+	confirmed.Header.Set("Idempotency-Key", "bearer-confirmed-preflight")
+	confirmedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(confirmedResponse, confirmed)
+	if confirmedResponse.Code != http.StatusCreated {
+		t.Fatalf("confirmed status=%d body=%s", confirmedResponse.Code, confirmedResponse.Body.String())
+	}
+	if strings.Contains(confirmedResponse.Body.String(), knowledge.Root()) {
+		t.Fatalf("confirmed response leaked private material: %s", confirmedResponse.Body.String())
+	}
+
+	clock := &browserSessionTestClock{now: now}
+	_, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 929)
+	config.BrowserSessionSecret = testBrowserSessionSecret
+	config.BrowserSessions = BrowserSessionHTTPConfig{
+		Store: sessionStore, PublicOrigin: testBrowserSessionOrigin,
+		TTL: testBrowserSessionCookieTTL, RenewalInterval: 5 * time.Minute, MaxActive: 10,
+	}
+	browserHandler := NewKBaseHTTPHandler(config)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Run Preflight Browser")
+	csrf, _ := loadKBaseBrowserSessionCSRF(t, browserHandler, credentials.Token)
+	browserRequest := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", credentials.Token, runBody)
+	browserRequest.Header.Set("Idempotency-Key", "browser-missing-preflight")
+	addKBaseBrowserSessionSecurityHeaders(browserRequest, csrf)
+	browserResponse := httptest.NewRecorder()
+	browserHandler.ServeHTTP(browserResponse, browserRequest)
+	if browserResponse.Code != http.StatusBadRequest || browserResponse.Body.String() != "{\"error\":\"preflight_required\"}\n" {
+		t.Fatalf("browser bypass status=%d body=%s", browserResponse.Code, browserResponse.Body.String())
+	}
+	assertResearchRunCount(t, research, 1)
+}
+
+func TestKBaseHTTPResearchRunPreflightRejectsProductionGateDriftWithoutRows(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		withWorker       bool
+		mode             string
+		preflightSources string
+		runSources       string
+		mutate           func(*testing.T, *kbaseHTTPHandler, *BookKnowledgeStore, AgentPackage, *SourceSyncStore)
+		wantStatus       int
+		wantError        string
+	}{
+		{
+			name: "package content changed", preflightSources: `["knowledge"]`, wantError: "package_changed",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, knowledge *BookKnowledgeStore, pkg AgentPackage, _ *SourceSyncStore) {
+				if err := writeFileAtomically(knowledge.AgentPackagePath(pkg.ContentHash), []byte(`{"broken":true}`)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "package artifact temporarily unreadable", preflightSources: `["knowledge"]`, wantStatus: http.StatusServiceUnavailable, wantError: "research_service_unavailable",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, knowledge *BookKnowledgeStore, pkg AgentPackage, _ *SourceSyncStore) {
+				path := knowledge.AgentPackagePath(pkg.ContentHash)
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "trusted evaluation changed", preflightSources: `["knowledge"]`, wantError: "package_changed",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, knowledge *BookKnowledgeStore, pkg AgentPackage, _ *SourceSyncStore) {
+				if err := writeFileAtomically(knowledge.AgentPackageEvaluationPath(pkg.ContentHash), []byte(`{"passed":false}`)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "evaluation artifact temporarily unreadable", preflightSources: `["knowledge"]`, wantStatus: http.StatusServiceUnavailable, wantError: "research_service_unavailable",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, knowledge *BookKnowledgeStore, pkg AgentPackage, _ *SourceSyncStore) {
+				path := knowledge.AgentPackageEvaluationPath(pkg.ContentHash)
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "worker readiness changed", withWorker: true, mode: ResearchModeDeep,
+			preflightSources: `["knowledge","chatlog"]`, runSources: `[" chatlog ","knowledge"]`, wantError: "readiness_changed",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, _ *BookKnowledgeStore, _ AgentPackage, source *SourceSyncStore) {
+				heartbeat := healthyResearchPreflightHeartbeat()
+				heartbeat.CapabilityHealth["chatlog_read"] = SourceCapabilityHealth{Healthy: false, Code: "dependency_unavailable"}
+				if _, err := source.HeartbeatAgent(heartbeat); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "budget readiness changed", preflightSources: `["knowledge"]`, wantError: "readiness_changed",
+			mutate: func(_ *testing.T, handler *kbaseHTTPHandler, _ *BookKnowledgeStore, _ AgentPackage, _ *SourceSyncStore) {
+				handler.researchQuickBudget.MaxEvidenceItems--
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mode := test.mode
+			if mode == "" {
+				mode = ResearchModeQuick
+			}
+			runSources := test.runSources
+			if runSources == "" {
+				runSources = test.preflightSources
+			}
+			wantStatus := test.wantStatus
+			if wantStatus == 0 {
+				wantStatus = http.StatusConflict
+			}
+			now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+			knowledge := NewBookKnowledgeStore(t.TempDir())
+			pkg := publishResearchPreflightServicePackage(
+				t, knowledge, "http-drift-agent", "release-http-drift", "citation-http-drift",
+				"generic HTTP drift evidence", now, nil,
+			)
+			research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+			var source *SourceSyncStore
+			if test.withWorker {
+				source = openResearchPreflightSourceStore(t, now)
+				if _, err := source.HeartbeatAgent(healthyResearchPreflightHeartbeat()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, source))
+			concrete := handler.(*kbaseHTTPHandler)
+			preflightBody := fmt.Sprintf(`{"mode":%q,"question":"generic HTTP drift evidence","requested_sources":%s}`, mode, test.preflightSources)
+			preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret", preflightBody)
+			if preflightResponse.Code != http.StatusCreated {
+				t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+			}
+			var preflight PublicResearchPreflightResult
+			if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+				t.Fatal(err)
+			}
+			if preflight.Status != ResearchPreflightStatusReady {
+				t.Fatalf("preflight=%#v", preflight)
+			}
+			test.mutate(t, concrete, knowledge, pkg, source)
+			runBody := fmt.Sprintf(`{"preflight_id":%q,"mode":%q,"question":"generic HTTP drift evidence","package_id":%q,"package_version":%q,"requested_sources":%s}`,
+				preflight.PreflightID, mode, pkg.PackageID, pkg.Version, runSources)
+			request := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(runBody))
+			request.Header.Set("Authorization", "Bearer admin-secret")
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", "drift-key")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != wantStatus || response.Body.String() != fmt.Sprintf("{\"error\":%q}\n", test.wantError) {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			assertResearchRunCount(t, research, 0)
+			for _, forbidden := range []string{"generic HTTP drift evidence", research.dbPath, knowledge.Root(), "database"} {
+				if forbidden != "" && strings.Contains(response.Body.String(), forbidden) {
+					t.Fatalf("error leaked %q: %s", forbidden, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPResearchRunPreflightRejectsBlockedSnapshotWithoutRows(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(t, knowledge, "http-blocked-confirm", "release-http-blocked-confirm", "citation-http-blocked-confirm", "generic blocked evidence", now, nil)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, nil))
+	preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret", `{"mode":"deep","question":"generic blocked evidence","requested_sources":["chatlog"]}`)
+	if preflightResponse.Code != http.StatusCreated {
+		t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+	}
+	var preflight PublicResearchPreflightResult
+	if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+		t.Fatal(err)
+	}
+	if preflight.Status != ResearchPreflightStatusBlocked {
+		t.Fatalf("preflight=%#v", preflight)
+	}
+	body := fmt.Sprintf(`{"preflight_id":%q,"mode":"deep","question":"generic blocked evidence","package_id":%q,"package_version":%q,"requested_sources":["chatlog"]}`, preflight.PreflightID, pkg.PackageID, pkg.Version)
+	request := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer admin-secret")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "blocked-key")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || response.Body.String() != "{\"error\":\"preflight_blocked\"}\n" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	assertResearchRunCount(t, research, 0)
+}
+
+func TestKBaseHTTPResearchRunPreflightReplaySurvivesLaterPackageDrift(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(t, knowledge, "http-replay-agent", "release-http-replay", "citation-http-replay", "generic replay evidence", now, nil)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, nil))
+	preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret", `{"mode":"quick","question":"generic replay evidence","requested_sources":["knowledge"]}`)
+	if preflightResponse.Code != http.StatusCreated {
+		t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+	}
+	var preflight PublicResearchPreflightResult
+	if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"preflight_id":%q,"mode":"quick","question":"generic replay evidence","package_id":%q,"package_version":%q,"requested_sources":["knowledge"]}`, preflight.PreflightID, pkg.PackageID, pkg.Version)
+	create := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer admin-secret")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "stable-replay-key")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	created := create()
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	if err := writeFileAtomically(knowledge.AgentPackageEvaluationPath(pkg.ContentHash), []byte(`{"passed":false}`)); err != nil {
+		t.Fatal(err)
+	}
+	replayed := create()
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) {
+		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	var createdPayload, replayedPayload struct {
+		Run struct {
+			RunID string `json:"run_id"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(replayed.Body.Bytes(), &replayedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if createdPayload.Run.RunID != replayedPayload.Run.RunID {
+		t.Fatalf("created=%#v replayed=%#v", createdPayload, replayedPayload)
+	}
+	assertResearchRunCount(t, research, 1)
+}
+
 func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
 	clock := &browserSessionTestClock{now: time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)}
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 903)
@@ -2754,15 +3051,20 @@ func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
 	}
 	concrete.researchQuickBudget = ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1}
 	concrete.researchDeepBudget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 40000, MaxModelCalls: 12, MaxCostUSD: 8}
+	concrete.researchPreflight = &ResearchPreflightService{
+		Knowledge: knowledge, Research: researchStore,
+		QuickBudget: concrete.researchQuickBudget, DeepBudget: concrete.researchDeepBudget,
+		Now: researchStore.now,
+	}
 	first := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Research Browser One")
 	second := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Research Browser Two")
 	csrf, _ := loadKBaseBrowserSessionCSRF(t, handler, first.Token)
-	body := fmt.Sprintf(
+	baseBody := fmt.Sprintf(
 		`{"mode":"quick","question":"只检索当前知识库","package_id":%q,"package_version":%q,"requested_sources":["knowledge"]}`,
 		pkg.PackageID, pkg.Version,
 	)
 
-	missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", first.Token, body)
+	missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", first.Token, baseBody)
 	missingCSRF.Header.Set("Idempotency-Key", "cookie-run")
 	missingResponse := httptest.NewRecorder()
 	handler.ServeHTTP(missingResponse, missingCSRF)
@@ -2770,6 +3072,19 @@ func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
 		t.Fatalf("missing CSRF status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
 	}
 
+	preflightRequest := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/preflight", first.Token,
+		`{"mode":"quick","question":"只检索当前知识库","requested_sources":["knowledge"]}`)
+	addKBaseBrowserSessionSecurityHeaders(preflightRequest, csrf)
+	preflightResponse := httptest.NewRecorder()
+	handler.ServeHTTP(preflightResponse, preflightRequest)
+	if preflightResponse.Code != http.StatusCreated {
+		t.Fatalf("cookie preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+	}
+	var preflight PublicResearchPreflightResult
+	if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.TrimSuffix(baseBody, "}") + fmt.Sprintf(`,"preflight_id":%q}`, preflight.PreflightID)
 	create := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", first.Token, body)
 	create.Header.Set("Idempotency-Key", "cookie-run")
 	addKBaseBrowserSessionSecurityHeaders(create, csrf)

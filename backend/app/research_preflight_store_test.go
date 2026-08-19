@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -94,7 +95,8 @@ func TestResearchPreflightStoreMigrationContainsNoRawQuestionColumns(t *testing.
 	}
 	for _, required := range []string{
 		"preflight_id", "owner_hash", "request_hash", "status", "candidates_json",
-		"checks_json", "gaps_json", "parent_run_id", "created_at", "expires_at",
+		"checks_json", "gaps_json", "mode", "requested_sources_json", "package_constraint",
+		"parent_run_id", "bound_run_id", "created_at", "expires_at",
 	} {
 		if !columns[required] {
 			t.Fatalf("missing migration column %q: %#v", required, columns)
@@ -104,6 +106,373 @@ func TestResearchPreflightStoreMigrationContainsNoRawQuestionColumns(t *testing.
 		if columns[forbidden] {
 			t.Fatalf("migration contains private column %q", forbidden)
 		}
+	}
+}
+
+func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(t *testing.T) {
+	root := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(root, researchStoreDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE research_runs (
+		run_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL,
+		schema_version TEXT NOT NULL, mode TEXT NOT NULL, question TEXT NOT NULL, status TEXT NOT NULL,
+		package_id TEXT NOT NULL DEFAULT '', package_version TEXT NOT NULL DEFAULT '',
+		subject_ids_json TEXT NOT NULL DEFAULT '[]', requested_sources_json TEXT NOT NULL DEFAULT '[]',
+		route_reasons_json TEXT NOT NULL DEFAULT '[]', actual_scope_json TEXT NOT NULL DEFAULT '{}',
+		budget_json TEXT NOT NULL DEFAULT '{}', wait_reason TEXT NOT NULL DEFAULT '', failure_json TEXT NOT NULL DEFAULT '',
+		version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+		lease_owner TEXT NOT NULL DEFAULT '', lease_epoch TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT ''
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, target := range []struct {
+		table  string
+		column string
+	}{
+		{table: "research_runs", column: "parent_run_id"},
+		{table: "research_runs", column: "preflight_id"},
+		{table: "research_preflights", column: "bound_run_id"},
+	} {
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, target.table, target.column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("missing %s.%s", target.table, target.column)
+		}
+	}
+}
+
+func TestResearchRunRequiresPreflightRejectsEveryMismatchWithoutRunRows(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *ResearchStore, *ResearchRunConfirmation)
+		want   error
+	}{
+		{name: "missing preflight", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.PreflightID = ""
+		}, want: ErrResearchPreflightRequired},
+		{name: "not found", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.PreflightID = "research-preflight-missing"
+		}, want: ErrResearchPreflightNotFound},
+		{name: "wrong owner", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.OwnerHash = testResearchPreflightOwnerB
+		}, want: ErrResearchPreflightOwner},
+		{name: "question changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.Question = "changed generic question"
+		}, want: ErrResearchPreflightRequestChanged},
+		{name: "mode changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.Mode = ResearchModeAuto
+		}, want: ErrResearchPreflightRequestChanged},
+		{name: "sources changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.RequestedSources = nil
+		}, want: ErrResearchPreflightRequestChanged},
+		{name: "package constraint changed", mutate: func(t *testing.T, store *ResearchStore, value *ResearchRunConfirmation) {
+			if _, err := store.db.Exec(`UPDATE research_preflights SET package_constraint = ? WHERE preflight_id = ?`, "candidate-other", value.Input.Request.PreflightID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: ErrResearchPreflightRequestChanged},
+		{name: "parent changed", mutate: func(t *testing.T, store *ResearchStore, value *ResearchRunConfirmation) {
+			if _, err := store.db.Exec(`UPDATE research_preflights SET parent_run_id = ? WHERE preflight_id = ?`, "research-run-other", value.Input.Request.PreflightID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: ErrResearchPreflightRequestChanged},
+		{name: "selection outside snapshot", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.PackageID = "candidate-other"
+			value.SelectedCandidate.PackageID = "candidate-other"
+		}, want: ErrResearchPreflightCandidate},
+		{name: "package version changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.PackageVersion = "2.0.0"
+			value.SelectedCandidate.PackageVersion = "2.0.0"
+		}, want: ErrResearchPreflightCandidate},
+		{name: "package content changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.SelectedCandidate.ContentHash = "changed-content-hash"
+		}, want: ErrResearchPreflightPackageChanged},
+		{name: "readiness changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.SelectedCandidate.Readiness = ResearchPreflightCheckWarning
+		}, want: ErrResearchPreflightReadinessChanged},
+		{name: "budget changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.SelectedCandidate.Budget.Limits.MaxIterations++
+		}, want: ErrResearchPreflightReadinessChanged},
+		{name: "blocked preflight", mutate: func(t *testing.T, store *ResearchStore, value *ResearchRunConfirmation) {
+			blocked := testResearchPreflight()
+			blocked.PreflightID = value.Input.Request.PreflightID
+			blocked.Status = ResearchPreflightStatusBlocked
+			blocked.Candidates[0].Readiness = ResearchPreflightCheckBlocked
+			blocked.Checks[0].Status = ResearchPreflightCheckBlocked
+			payload, err := encodeResearchPreflightPayload(blocked)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.Exec(`UPDATE research_preflights SET status = ?, candidates_json = ?, checks_json = ? WHERE preflight_id = ?`, blocked.Status, payload.candidatesJSON, payload.checksJSON, value.Input.Request.PreflightID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: ErrResearchPreflightBlocked},
+		{name: "blocked selected candidate", mutate: func(t *testing.T, store *ResearchStore, value *ResearchRunConfirmation) {
+			preflight, err := store.LoadResearchPreflightForOwner(value.Input.Request.PreflightID, value.OwnerHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preflight.Candidates[0].Readiness = ResearchPreflightCheckBlocked
+			preflight.Status = ResearchPreflightStatusBlocked
+			payload, err := encodeResearchPreflightPayload(*preflight)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.Exec(`UPDATE research_preflights SET status = ?, candidates_json = ? WHERE preflight_id = ?`, preflight.Status, payload.candidatesJSON, preflight.PreflightID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: ErrResearchPreflightBlocked},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openResearchRunConfirmationStore(t)
+			confirmation := saveResearchRunConfirmationPreflight(t, store, "")
+			test.mutate(t, store, &confirmation)
+			if run, created, err := store.ConfirmResearchRun(confirmation); run != nil || created || !errors.Is(err, test.want) {
+				t.Fatalf("run=%#v created=%v error=%v want=%v", run, created, err, test.want)
+			}
+			assertResearchRunCount(t, store, 0)
+		})
+	}
+}
+
+func TestResearchRunRequiresPreflightRejectsExpiryAndParentOwnershipWithoutRunRows(t *testing.T) {
+	t.Run("expired", func(t *testing.T) {
+		now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+		store, err := OpenResearchStore(t.TempDir(), func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		confirmation := saveResearchRunConfirmationPreflight(t, store, "")
+		now = now.Add(researchPreflightStoreTTL)
+		if _, _, err := store.ConfirmResearchRun(confirmation); !errors.Is(err, ErrResearchPreflightExpired) {
+			t.Fatalf("error=%v", err)
+		}
+		assertResearchRunCount(t, store, 0)
+	})
+	for _, test := range []struct {
+		name, parentOwner string
+		want              error
+	}{
+		{name: "parent missing", want: ErrResearchRunNotFound},
+		{name: "parent wrong owner", parentOwner: testResearchPreflightOwnerB, want: ErrResearchRunNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := openResearchRunConfirmationStore(t)
+			parent := ResearchRun{RunID: "research-run-missing"}
+			wantRows := 0
+			if test.parentOwner != "" {
+				parent = createResearchRunForTest(t, store, "parent-"+test.name)
+				wantRows = 1
+			}
+			if test.parentOwner != "" {
+				if _, err := store.db.Exec(`INSERT INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?)`, parent.RunID, test.parentOwner, parent.CreatedAt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			confirmation := saveResearchRunConfirmationPreflight(t, store, parent.RunID)
+			if _, _, err := store.ConfirmResearchRun(confirmation); !errors.Is(err, test.want) {
+				t.Fatalf("error=%v", err)
+			}
+			assertResearchRunCount(t, store, wantRows)
+		})
+	}
+}
+
+func TestResearchRunRequiresPreflightBindsOnceReplaysAndInheritsLinks(t *testing.T) {
+	store := openResearchRunConfirmationStore(t)
+	parent := createResearchRunForTest(t, store, "owned-parent")
+	if _, err := store.db.Exec(`INSERT INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?)`, parent.RunID, testResearchPreflightOwnerA, parent.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	confirmation := saveResearchRunConfirmationPreflight(t, store, parent.RunID)
+	snapshotBefore, err := store.LoadResearchPreflightForOwner(confirmation.Input.Request.PreflightID, testResearchPreflightOwnerA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created, wasCreated, err := store.ConfirmResearchRun(confirmation)
+	if err != nil || !wasCreated {
+		t.Fatalf("created=%#v wasCreated=%v error=%v", created, wasCreated, err)
+	}
+	if created.ParentRunID != parent.RunID || created.PreflightID != confirmation.Input.Request.PreflightID {
+		t.Fatalf("links=%#v", created)
+	}
+	replayed, wasCreated, err := store.ConfirmResearchRun(confirmation)
+	if err != nil || wasCreated || replayed.RunID != created.RunID {
+		t.Fatalf("replay=%#v created=%v error=%v", replayed, wasCreated, err)
+	}
+
+	differentKey := confirmation
+	differentKey.Input.IdempotencyKey = "different-key"
+	if _, _, err := store.ConfirmResearchRun(differentKey); !errors.Is(err, ErrResearchPreflightConsumed) {
+		t.Fatalf("different key error=%v", err)
+	}
+	differentSelection := confirmation
+	differentSelection.Input.Request.PackageVersion = "2.0.0"
+	differentSelection.SelectedCandidate.PackageVersion = "2.0.0"
+	if _, _, err := store.ConfirmResearchRun(differentSelection); !errors.Is(err, ErrResearchRunIdempotencyConflict) {
+		t.Fatalf("different selection error=%v", err)
+	}
+	snapshotAfter, err := store.LoadResearchPreflightForOwner(confirmation.Input.Request.PreflightID, testResearchPreflightOwnerA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(snapshotAfter, snapshotBefore) {
+		t.Fatalf("confirmation mutated or renewed snapshot: before=%#v after=%#v", snapshotBefore, snapshotAfter)
+	}
+	assertResearchRunCount(t, store, 2)
+}
+
+func TestResearchRunRequiresPreflightConcurrentConfirmationReturnsOneRunWithoutRawSQLiteErrors(t *testing.T) {
+	store := openResearchRunConfirmationStore(t)
+	confirmation := saveResearchRunConfirmationPreflight(t, store, "")
+	start := make(chan struct{})
+	type result struct {
+		run     *ResearchRun
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for index := 0; index < 2; index++ {
+		go func() {
+			<-start
+			run, created, err := store.ConfirmResearchRun(confirmation)
+			results <- result{run: run, created: created, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	for _, outcome := range []result{first, second} {
+		if outcome.err != nil || outcome.run == nil {
+			t.Fatalf("raw concurrent outcome=%#v", outcome)
+		}
+	}
+	if first.run.RunID != second.run.RunID || first.created == second.created {
+		t.Fatalf("outcomes=%#v %#v", first, second)
+	}
+	assertResearchRunCount(t, store, 1)
+}
+
+func TestResearchRunRequiresPreflightBoundReplaySurvivesExpiryWithoutRenewingSnapshot(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	store, err := OpenResearchStore(t.TempDir(), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	confirmation := saveResearchRunConfirmationPreflight(t, store, "")
+	created, wasCreated, err := store.ConfirmResearchRun(confirmation)
+	if err != nil || !wasCreated {
+		t.Fatalf("create=%#v created=%v error=%v", created, wasCreated, err)
+	}
+	now = now.Add(researchPreflightStoreTTL + time.Second)
+	replayed, wasCreated, err := store.ConfirmResearchRun(confirmation)
+	if err != nil || wasCreated || replayed.RunID != created.RunID {
+		t.Fatalf("expired replay=%#v created=%v error=%v", replayed, wasCreated, err)
+	}
+}
+
+func TestResearchRunRequiresPreflightConcurrentHandlesReplayWithoutBusyOrUnique(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	storeA, err := OpenResearchStore(root, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeA.Close()
+	storeB, err := OpenResearchStore(root, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
+	confirmation := saveResearchRunConfirmationPreflight(t, storeA, "")
+	start := make(chan struct{})
+	type result struct {
+		run     *ResearchRun
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for _, store := range []*ResearchStore{storeA, storeB} {
+		go func(current *ResearchStore) {
+			<-start
+			run, created, err := current.ConfirmResearchRun(confirmation)
+			results <- result{run: run, created: created, err: err}
+		}(store)
+	}
+	close(start)
+	first, second := <-results, <-results
+	for _, outcome := range []result{first, second} {
+		if outcome.err != nil || outcome.run == nil {
+			t.Fatalf("concurrent handles returned run=%#v created=%v error=%v", outcome.run, outcome.created, outcome.err)
+		}
+	}
+	if first.run.RunID != second.run.RunID || first.created == second.created {
+		t.Fatalf("concurrent handle outcomes=%#v %#v", first, second)
+	}
+	assertResearchRunCount(t, storeA, 1)
+}
+
+func openResearchRunConfirmationStore(t *testing.T) *ResearchStore {
+	t.Helper()
+	store, err := OpenResearchStore(t.TempDir(), func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func saveResearchRunConfirmationPreflight(t *testing.T, store *ResearchStore, parentRunID string) ResearchRunConfirmation {
+	t.Helper()
+	request := ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "generic confirmation question",
+		RequestedSources: []string{ResearchSourceKnowledge}, PackageConstraint: "candidate-a", ParentRunID: parentRunID,
+	}
+	result := testResearchPreflight()
+	result.PreflightID = "research-preflight-confirm-" + strings.ReplaceAll(parentRunID, "research-run-", "")
+	result.ParentRunID = parentRunID
+	result.Checks = []ResearchPreflightCheck{{Code: "package_ready", Status: ResearchPreflightCheckPass, ResultCode: "validated"}}
+	budget := ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1}
+	result.Candidates[0].Budget = ResearchPreflightBudget{ResolvedMode: ResearchModeQuick, Limits: budget}
+	created, err := store.SaveResearchPreflight(testResearchPreflightOwnerA, request, result, researchPreflightStoreTTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ResearchRunConfirmation{
+		OwnerHash: testResearchPreflightOwnerA,
+		Input: ResearchRunInput{
+			IdempotencyKey: "confirmation-key",
+			Request:        ResearchRunRequest{PreflightID: created.PreflightID, Mode: ResearchModeQuick, Question: request.Question, PackageID: "candidate-a", PackageVersion: "1.0.0", RequestedSources: request.RequestedSources},
+			Mode:           ResearchModeQuick, RouteReasons: []string{ResearchRouteExplicitQuick}, Budget: budget,
+		},
+		SelectedCandidate: result.Candidates[0],
+	}
+}
+
+func assertResearchRunCount(t *testing.T, store *ResearchStore, want int) {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM research_runs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("research_runs rows=%d want=%d", count, want)
 	}
 }
 

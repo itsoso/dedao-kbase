@@ -56,6 +56,7 @@ const (
 )
 
 type ResearchRunRequest struct {
+	PreflightID      string   `json:"preflight_id,omitempty"`
 	Mode             string   `json:"mode"`
 	Question         string   `json:"question"`
 	PackageID        string   `json:"package_id,omitempty"`
@@ -67,6 +68,8 @@ type ResearchRunRequest struct {
 type ResearchRun struct {
 	SchemaVersion    string            `json:"schema_version"`
 	RunID            string            `json:"run_id"`
+	ParentRunID      string            `json:"parent_run_id,omitempty"`
+	PreflightID      string            `json:"preflight_id,omitempty"`
 	Mode             string            `json:"mode"`
 	Question         string            `json:"question"`
 	Status           ResearchRunStatus `json:"status"`
@@ -125,6 +128,13 @@ type ResearchTransition struct {
 }
 
 func ValidateResearchRunRequest(request ResearchRunRequest) error {
+	preflightID := strings.TrimSpace(request.PreflightID)
+	if preflightID != "" {
+		if len([]rune(preflightID)) > researchPreflightIDMaxRunes ||
+			!validResearchPreflightResourceID(preflightID) || preflightID != request.PreflightID {
+			return fmt.Errorf("preflight_id must be a canonical bounded Research resource ID")
+		}
+	}
 	mode := strings.TrimSpace(request.Mode)
 	if mode == "" {
 		mode = ResearchModeAuto

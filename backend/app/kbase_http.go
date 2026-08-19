@@ -4583,6 +4583,8 @@ type researchRunHTTPFailure struct {
 type researchRunHTTPView struct {
 	SchemaVersion    string                  `json:"schema_version"`
 	RunID            string                  `json:"run_id"`
+	ParentRunID      string                  `json:"parent_run_id,omitempty"`
+	PreflightID      string                  `json:"preflight_id,omitempty"`
 	Mode             string                  `json:"mode"`
 	Question         string                  `json:"question"`
 	Status           ResearchRunStatus       `json:"status"`
@@ -4823,53 +4825,50 @@ func (h *kbaseHTTPHandler) handleResearchRunCreate(w http.ResponseWriter, r *htt
 	if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchRunHTTPMaxBodyBytes, &request) {
 		return
 	}
+	if strings.TrimSpace(request.PreflightID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "preflight_required")
+		return
+	}
+	normalized, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+		Mode: request.Mode, Question: request.Question, RequestedSources: request.RequestedSources,
+	})
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_research_request")
+		return
+	}
+	request.Mode = normalized.Mode
+	request.Question = normalized.Question
+	request.RequestedSources = normalized.RequestedSources
 	mode, reasons, err := RouteResearchMode(request)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_research_request")
 		return
 	}
-	requestedMode := strings.TrimSpace(request.Mode)
-	if requestedMode == "" {
-		requestedMode = ResearchModeAuto
-	}
-	pkg, err := loadRunnableResearchAgentPackageScope(
-		r.Context(), h.store, request.PackageID, request.PackageVersion, requestedMode, request.RequestedSources,
-	)
-	if err == nil && requestedMode != mode {
-		err = validateResearchAgentPackageScope(*pkg, mode, request.RequestedSources)
-	}
-	if err != nil {
-		writeHTTPError(w, http.StatusBadRequest, "research_package_not_eligible")
-		return
-	}
-	budget := h.researchQuickBudget
-	if mode == ResearchModeDeep {
-		budget = h.researchDeepBudget
-	}
-	budget = boundResearchBudgetByPolicy(budget, *pkg.ResearchPolicy)
 	keyDigest := sha256.Sum256([]byte(ownerHash + "\x00" + strings.TrimSpace(idempotencyKey)))
-	run, created, err := h.researchStore.CreateRun(ResearchRunInput{
+	input := ResearchRunInput{
 		IdempotencyKey: hex.EncodeToString(keyDigest[:]), Request: request, Mode: mode,
-		RouteReasons: reasons, Budget: budget,
-	})
-	if errors.Is(err, ErrResearchRunIdempotencyConflict) {
-		writeHTTPError(w, http.StatusConflict, "research_idempotency_conflict")
+		RouteReasons: reasons,
+	}
+	if replayed, found, err := h.researchStore.ReplayConfirmedResearchRun(ownerHash, input); err != nil {
+		h.writeResearchRunHTTPError(w, err)
+		return
+	} else if found {
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"created": false, "run": publicResearchRun(*replayed)})
 		return
 	}
+	selected, err := h.revalidateResearchRunSelection(r.Context(), request, mode)
 	if err != nil {
-		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		h.writeResearchRunHTTPError(w, err)
 		return
 	}
-	if _, err := h.researchStore.db.Exec(`INSERT OR IGNORE INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?)`,
-		run.RunID, ownerHash, h.researchStore.now().UTC().Format(time.RFC3339Nano)); err != nil {
-		if created {
-			_, _ = h.researchStore.db.Exec(`DELETE FROM research_runs WHERE run_id = ?`, run.RunID)
-		}
-		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
-		return
-	}
-	if !h.researchRunOwned(run.RunID, ownerHash) {
-		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+	input.Budget = selected.Budget.Limits
+	run, created, err := h.researchStore.ConfirmResearchRun(ResearchRunConfirmation{
+		OwnerHash:         ownerHash,
+		Input:             input,
+		SelectedCandidate: selected,
+	})
+	if err != nil {
+		h.writeResearchRunHTTPError(w, err)
 		return
 	}
 	status := http.StatusOK
@@ -4877,6 +4876,67 @@ func (h *kbaseHTTPHandler) handleResearchRunCreate(w http.ResponseWriter, r *htt
 		status = http.StatusCreated
 	}
 	writeHTTPJSON(w, status, map[string]any{"created": created, "run": publicResearchRun(*run)})
+}
+
+func (h *kbaseHTTPHandler) revalidateResearchRunSelection(
+	ctx context.Context,
+	request ResearchRunRequest,
+	resolvedMode string,
+) (ResearchPreflightCandidate, error) {
+	if h.store == nil || h.researchPreflight == nil {
+		return ResearchPreflightCandidate{}, ErrResearchPreflightUnavailable
+	}
+	requestedMode := strings.TrimSpace(request.Mode)
+	if requestedMode == "" {
+		requestedMode = ResearchModeAuto
+	}
+	pkg, err := loadRunnableAgentPackageContext(
+		ctx, h.store, request.PackageID, request.PackageVersion, "search",
+	)
+	if err == nil {
+		err = ValidateAgentPackage(*pkg, h.store, AgentPackageKnownToolIDs())
+	}
+	if err == nil {
+		err = validateResearchAgentPackageScope(*pkg, requestedMode, request.RequestedSources)
+	}
+	if err == nil && requestedMode != resolvedMode {
+		err = validateResearchAgentPackageScope(*pkg, resolvedMode, request.RequestedSources)
+	}
+	if err != nil {
+		if researchPreflightDependencyRetryable(err) {
+			return ResearchPreflightCandidate{}, ErrResearchPreflightUnavailable
+		}
+		return ResearchPreflightCandidate{}, ErrResearchPreflightPackageChanged
+	}
+	now := h.researchStore.now().UTC()
+	_, workerRankState, err := h.researchPreflight.workerReadiness(ResearchPreflightRequest{
+		Mode: requestedMode, Question: request.Question, RequestedSources: request.RequestedSources,
+	}, now)
+	if err != nil {
+		return ResearchPreflightCandidate{}, err
+	}
+	serverBudget := h.researchQuickBudget
+	if resolvedMode == ResearchModeDeep {
+		serverBudget = h.researchDeepBudget
+	}
+	budget := ResearchPreflightBudget{
+		ResolvedMode: resolvedMode,
+		Limits:       boundResearchBudgetByPolicy(serverBudget, *pkg.ResearchPolicy),
+	}
+	facts := []ResearchPreflightPackageFacts{{
+		Package: *pkg, TopicHits: researchPreflightTopicHits(request.Question, *pkg),
+		LatestPublishedAt: pkg.PublishedAt, RunnablePackageValidated: true, EvaluationPassed: true,
+		WorkerState: workerRankState, BudgetFits: researchPreflightBudgetFits(budget),
+	}}
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: requestedMode, Question: request.Question, RequestedSources: request.RequestedSources,
+		PackageConstraint: strings.TrimSpace(request.PackageID),
+	}, facts)
+	if len(candidates) != 1 {
+		return ResearchPreflightCandidate{}, ErrResearchPreflightPackageChanged
+	}
+	candidates[0].Budget = budget
+	return candidates[0], nil
 }
 
 func (h *kbaseHTTPHandler) handleResearchRunDetail(w http.ResponseWriter, runID, ownerHash string) {
@@ -5160,6 +5220,23 @@ func (h *kbaseHTTPHandler) researchRunOwned(runID, ownerHash string) bool {
 
 func (h *kbaseHTTPHandler) writeResearchRunHTTPError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrResearchPreflightRequired):
+		writeHTTPError(w, http.StatusBadRequest, "preflight_required")
+	case errors.Is(err, ErrResearchPreflightNotFound), errors.Is(err, ErrResearchPreflightOwner):
+		writeHTTPError(w, http.StatusNotFound, "research_preflight_not_found")
+	case errors.Is(err, ErrResearchPreflightExpired):
+		writeHTTPError(w, http.StatusGone, "preflight_expired")
+	case errors.Is(err, ErrResearchPreflightPackageChanged):
+		writeHTTPError(w, http.StatusConflict, "package_changed")
+	case errors.Is(err, ErrResearchPreflightReadinessChanged):
+		writeHTTPError(w, http.StatusConflict, "readiness_changed")
+	case errors.Is(err, ErrResearchPreflightBlocked):
+		writeHTTPError(w, http.StatusConflict, "preflight_blocked")
+	case errors.Is(err, ErrResearchPreflightRequestChanged), errors.Is(err, ErrResearchPreflightCandidate),
+		errors.Is(err, ErrResearchPreflightConsumed):
+		writeHTTPError(w, http.StatusConflict, "research_preflight_conflict")
+	case errors.Is(err, ErrResearchRunIdempotencyConflict):
+		writeHTTPError(w, http.StatusConflict, "research_idempotency_conflict")
 	case errors.Is(err, ErrResearchRunNotFound):
 		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
 	case errors.Is(err, ErrResearchRunVersionConflict):
@@ -5171,7 +5248,8 @@ func (h *kbaseHTTPHandler) writeResearchRunHTTPError(w http.ResponseWriter, err 
 
 func publicResearchRun(run ResearchRun) researchRunHTTPView {
 	view := researchRunHTTPView{
-		SchemaVersion: run.SchemaVersion, RunID: run.RunID, Mode: run.Mode, Question: run.Question,
+		SchemaVersion: run.SchemaVersion, RunID: run.RunID, ParentRunID: run.ParentRunID, PreflightID: run.PreflightID,
+		Mode: run.Mode, Question: run.Question,
 		Status: run.Status, PackageID: run.PackageID, PackageVersion: run.PackageVersion,
 		RequestedSources: append([]string(nil), run.RequestedSources...), RouteReasons: append([]string(nil), run.RouteReasons...),
 		ActualScope: publicResearchScope(run.ActualScope), Budget: run.Budget, WaitReason: run.WaitReason, Version: run.Version,

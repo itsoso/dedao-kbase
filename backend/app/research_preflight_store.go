@@ -32,12 +32,89 @@ var (
 	ErrResearchPreflightIdempotencyConflict = errors.New("research preflight idempotency conflict")
 	ErrResearchPreflightUnavailable         = errors.New("research preflight store unavailable")
 	ErrResearchPreflightCorrupt             = errors.New("research preflight persisted data is corrupt")
+	ErrResearchPreflightRequired            = errors.New("research preflight is required")
+	ErrResearchPreflightRequestChanged      = errors.New("research preflight request changed")
+	ErrResearchPreflightCandidate           = errors.New("research preflight candidate is not selected")
+	ErrResearchPreflightPackageChanged      = errors.New("research preflight package changed")
+	ErrResearchPreflightReadinessChanged    = errors.New("research preflight readiness changed")
+	ErrResearchPreflightBlocked             = errors.New("research preflight is blocked")
+	ErrResearchPreflightConsumed            = errors.New("research preflight is already consumed")
 )
 
 type researchPreflightRecord struct {
-	preflightID, ownerHash, requestHash, status string
-	candidatesJSON, checksJSON, gapsJSON        string
-	parentRunID, createdAt, expiresAt           string
+	preflightID, ownerHash, requestHash, status   string
+	candidatesJSON, checksJSON, gapsJSON          string
+	mode, requestedSourcesJSON, packageConstraint string
+	parentRunID, boundRunID, createdAt, expiresAt string
+}
+
+type ResearchRunConfirmation struct {
+	OwnerHash         string
+	Input             ResearchRunInput
+	SelectedCandidate ResearchPreflightCandidate
+}
+
+func (s *ResearchStore) ReplayConfirmedResearchRun(
+	ownerHash string,
+	input ResearchRunInput,
+) (*ResearchRun, bool, error) {
+	if err := validateResearchPreflightOwnerHash(ownerHash); err != nil {
+		return nil, false, err
+	}
+	if strings.TrimSpace(input.Request.PreflightID) == "" {
+		return nil, false, ErrResearchPreflightRequired
+	}
+	if err := ValidateResearchRunRequest(input.Request); err != nil {
+		return nil, false, err
+	}
+	if strings.TrimSpace(input.IdempotencyKey) == "" || len([]rune(input.IdempotencyKey)) > researchIdempotencyKeyMax {
+		return nil, false, fmt.Errorf("idempotency_key is required and must not exceed %d characters", researchIdempotencyKeyMax)
+	}
+	if input.Mode != ResearchModeQuick && input.Mode != ResearchModeDeep {
+		return nil, false, fmt.Errorf("resolved mode must be quick or deep")
+	}
+	if len(input.RouteReasons) == 0 || len(input.RouteReasons) > researchRouteReasonsMax {
+		return nil, false, fmt.Errorf("route_reasons must contain 1 to %d items", researchRouteReasonsMax)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("begin research run replay", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var runID, storedHash string
+	err = tx.QueryRow(`SELECT run_id, request_hash FROM research_runs WHERE idempotency_key = ?`,
+		input.IdempotencyKey).Scan(&runID, &storedHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("load research run replay", err)
+	}
+	run, err := loadResearchRun(tx, runID)
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("decode research run replay", err)
+	}
+	var ownerCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM research_http_owners WHERE run_id = ? AND owner_hash = ?`,
+		runID, ownerHash).Scan(&ownerCount); err != nil {
+		return nil, false, classifyResearchPreflightStoreError("validate research run replay owner", err)
+	}
+	if ownerCount != 1 || run.PreflightID != strings.TrimSpace(input.Request.PreflightID) {
+		return nil, false, ErrResearchRunIdempotencyConflict
+	}
+	expected := input
+	expected.Budget = run.Budget
+	expectedHash, err := hashResearchRunInput(expected)
+	if err != nil {
+		return nil, false, err
+	}
+	if expectedHash != storedHash {
+		return nil, false, ErrResearchRunIdempotencyConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, classifyResearchPreflightStoreError("commit research run replay", err)
+	}
+	return run, true, nil
 }
 
 func (s *ResearchStore) SaveResearchPreflight(
@@ -88,13 +165,18 @@ func (s *ResearchStore) SaveResearchPreflight(
 		return nil, classifyResearchPreflightStoreError("begin preflight save", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	requestedSourcesJSON, err := marshalBoundedResearchPreflightJSON(normalized.RequestedSources)
+	if err != nil {
+		return nil, err
+	}
 	inserted, err := tx.Exec(`INSERT INTO research_preflights (
 		preflight_id, owner_hash, request_hash, status, candidates_json, checks_json, gaps_json,
-		parent_run_id, created_at, expires_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		mode, requested_sources_json, package_constraint, parent_run_id, bound_run_id, created_at, expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
 	ON CONFLICT(preflight_id) DO NOTHING`,
 		result.PreflightID, ownerHash, result.RequestHash, result.Status,
 		incoming.candidatesJSON, incoming.checksJSON, incoming.gapsJSON,
+		normalized.Mode, string(requestedSourcesJSON), normalized.PackageConstraint,
 		result.ParentRunID, result.CreatedAt, result.ExpiresAt)
 	if err != nil {
 		return nil, classifyResearchPreflightStoreError("insert preflight", err)
@@ -134,6 +216,8 @@ func (s *ResearchStore) SaveResearchPreflight(
 		return nil, ErrResearchPreflightIdempotencyConflict
 	}
 	if existing.Status != result.Status || existing.ParentRunID != result.ParentRunID ||
+		record.mode != normalized.Mode || record.requestedSourcesJSON != string(requestedSourcesJSON) ||
+		record.packageConstraint != normalized.PackageConstraint || record.boundRunID != "" ||
 		record.candidatesJSON != incoming.candidatesJSON ||
 		record.checksJSON != incoming.checksJSON || record.gapsJSON != incoming.gapsJSON {
 		return nil, ErrResearchPreflightIdempotencyConflict
@@ -142,6 +226,229 @@ func (s *ResearchStore) SaveResearchPreflight(
 		return nil, classifyResearchPreflightStoreError("commit preflight replay", err)
 	}
 	return existing, nil
+}
+
+func (s *ResearchStore) ConfirmResearchRun(confirmation ResearchRunConfirmation) (*ResearchRun, bool, error) {
+	preflightID := strings.TrimSpace(confirmation.Input.Request.PreflightID)
+	if preflightID == "" {
+		return nil, false, ErrResearchPreflightRequired
+	}
+	if err := validateResearchPreflightID(preflightID); err != nil {
+		return nil, false, err
+	}
+	if err := validateResearchPreflightOwnerHash(confirmation.OwnerHash); err != nil {
+		return nil, false, err
+	}
+	if err := validateResearchRunInput(confirmation.Input); err != nil {
+		return nil, false, err
+	}
+	selected := confirmation.SelectedCandidate
+	if strings.TrimSpace(selected.PackageID) != strings.TrimSpace(confirmation.Input.Request.PackageID) ||
+		strings.TrimSpace(selected.PackageVersion) != strings.TrimSpace(confirmation.Input.Request.PackageVersion) {
+		return nil, false, ErrResearchPreflightCandidate
+	}
+	requestHash, err := hashResearchRunInput(confirmation.Input)
+	if err != nil {
+		return nil, false, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		run, created, confirmErr := s.confirmResearchRunOnce(confirmation, requestHash)
+		if confirmErr == nil || !researchPreflightSQLiteRetryable(confirmErr) {
+			return run, created, confirmErr
+		}
+	}
+	return nil, false, fmt.Errorf("%w: confirm research run remained busy", ErrResearchPreflightUnavailable)
+}
+
+func (s *ResearchStore) confirmResearchRunOnce(
+	confirmation ResearchRunConfirmation,
+	requestHash string,
+) (*ResearchRun, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("begin research run confirmation", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	preflightID := strings.TrimSpace(confirmation.Input.Request.PreflightID)
+	record, err := queryResearchPreflightRecord(tx, preflightID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, ErrResearchPreflightNotFound
+	}
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("load confirmation preflight", err)
+	}
+	if err := validateResearchPreflightOwnerHash(record.ownerHash); err != nil {
+		return nil, false, corruptResearchPreflightError("validate confirmation owner", err)
+	}
+	if record.ownerHash != confirmation.OwnerHash {
+		return nil, false, ErrResearchPreflightOwner
+	}
+	if record.boundRunID != "" {
+		var existingKey, existingHash string
+		err := tx.QueryRow(`SELECT idempotency_key, request_hash FROM research_runs WHERE run_id = ?`, record.boundRunID).Scan(&existingKey, &existingHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, corruptResearchPreflightError("bound run is missing", err)
+		}
+		if err != nil {
+			return nil, false, classifyResearchPreflightStoreError("load bound run", err)
+		}
+		if existingKey == confirmation.Input.IdempotencyKey {
+			if existingHash != requestHash {
+				return nil, false, ErrResearchRunIdempotencyConflict
+			}
+			var ownerCount int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM research_http_owners WHERE run_id = ? AND owner_hash = ?`,
+				record.boundRunID, confirmation.OwnerHash).Scan(&ownerCount); err != nil {
+				return nil, false, classifyResearchPreflightStoreError("validate bound run owner", err)
+			}
+			if ownerCount != 1 {
+				return nil, false, corruptResearchPreflightError("bound run owner is missing", nil)
+			}
+			run, err := loadResearchRun(tx, record.boundRunID)
+			return run, false, err
+		}
+		return nil, false, ErrResearchPreflightConsumed
+	}
+	preflight, err := decodeResearchPreflightRecord(record)
+	if err != nil {
+		return nil, false, err
+	}
+	if researchPreflightExpired(preflight.ExpiresAt, s.now()) {
+		return nil, false, ErrResearchPreflightExpired
+	}
+
+	normalizedRequest, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+		Mode: confirmation.Input.Request.Mode, Question: confirmation.Input.Request.Question,
+		RequestedSources:  confirmation.Input.Request.RequestedSources,
+		PackageConstraint: record.packageConstraint, ParentRunID: record.parentRunID,
+	})
+	if err != nil {
+		return nil, false, ErrResearchPreflightRequestChanged
+	}
+	normalizedSourcesJSON, err := marshalBoundedResearchPreflightJSON(normalizedRequest.RequestedSources)
+	if err != nil {
+		return nil, false, err
+	}
+	preflightRequestHash, err := hashResearchPreflightRequest(normalizedRequest)
+	if err != nil {
+		return nil, false, err
+	}
+	if record.mode != normalizedRequest.Mode || record.requestedSourcesJSON != string(normalizedSourcesJSON) ||
+		preflightRequestHash != record.requestHash {
+		return nil, false, ErrResearchPreflightRequestChanged
+	}
+
+	if preflight.Status != ResearchPreflightStatusReady {
+		return nil, false, ErrResearchPreflightBlocked
+	}
+	for _, check := range preflight.Checks {
+		if check.Status == ResearchPreflightCheckBlocked {
+			return nil, false, ErrResearchPreflightBlocked
+		}
+	}
+
+	var snapshot *ResearchPreflightCandidate
+	for index := range preflight.Candidates {
+		candidate := &preflight.Candidates[index]
+		if candidate.PackageID == strings.TrimSpace(confirmation.Input.Request.PackageID) &&
+			candidate.PackageVersion == strings.TrimSpace(confirmation.Input.Request.PackageVersion) {
+			snapshot = candidate
+			break
+		}
+	}
+	if snapshot == nil {
+		return nil, false, ErrResearchPreflightCandidate
+	}
+	if snapshot.Readiness == ResearchPreflightCheckBlocked {
+		return nil, false, ErrResearchPreflightBlocked
+	}
+	selected := confirmation.SelectedCandidate
+	if selected.PackageID != snapshot.PackageID || selected.PackageVersion != snapshot.PackageVersion ||
+		selected.ContentHash != snapshot.ContentHash {
+		return nil, false, ErrResearchPreflightPackageChanged
+	}
+	if selected.Readiness != snapshot.Readiness || selected.Budget != snapshot.Budget ||
+		selected.Budget.ResolvedMode != confirmation.Input.Mode || selected.Budget.Limits != confirmation.Input.Budget {
+		return nil, false, ErrResearchPreflightReadinessChanged
+	}
+	if record.parentRunID != "" {
+		var parentCount int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM research_http_owners WHERE run_id = ? AND owner_hash = ?`,
+			record.parentRunID, confirmation.OwnerHash).Scan(&parentCount); err != nil {
+			return nil, false, classifyResearchPreflightStoreError("validate parent run owner", err)
+		}
+		if parentCount != 1 {
+			return nil, false, ErrResearchRunNotFound
+		}
+	}
+
+	var existingID, existingHash string
+	err = tx.QueryRow(`SELECT run_id, request_hash FROM research_runs WHERE idempotency_key = ?`,
+		confirmation.Input.IdempotencyKey).Scan(&existingID, &existingHash)
+	if err == nil {
+		if existingHash != requestHash || existingID != record.boundRunID {
+			return nil, false, ErrResearchRunIdempotencyConflict
+		}
+		run, err := loadResearchRun(tx, existingID)
+		return run, false, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, classifyResearchPreflightStoreError("load confirmation idempotency", err)
+	}
+
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	run := &ResearchRun{
+		SchemaVersion: ResearchRunSchemaVersion, RunID: newResearchRunID(), ParentRunID: record.parentRunID,
+		PreflightID: preflightID, Mode: confirmation.Input.Mode,
+		Question: strings.TrimSpace(confirmation.Input.Request.Question), Status: ResearchPlanning,
+		PackageID:        strings.TrimSpace(confirmation.Input.Request.PackageID),
+		PackageVersion:   strings.TrimSpace(confirmation.Input.Request.PackageVersion),
+		SubjectIDs:       append([]string(nil), confirmation.Input.Request.SubjectIDs...),
+		RequestedSources: append([]string(nil), confirmation.Input.Request.RequestedSources...),
+		RouteReasons:     append([]string(nil), confirmation.Input.RouteReasons...), Budget: confirmation.Input.Budget,
+		Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	values, err := marshalResearchRunValues(run)
+	if err != nil {
+		return nil, false, err
+	}
+	_, err = tx.Exec(`INSERT INTO research_runs (
+		run_id, parent_run_id, preflight_id, idempotency_key, request_hash, schema_version, mode, question, status,
+		package_id, package_version, subject_ids_json, requested_sources_json, route_reasons_json,
+		actual_scope_json, budget_json, wait_reason, failure_json, version, created_at, updated_at,
+		lease_owner, lease_epoch, lease_expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.RunID, run.ParentRunID, run.PreflightID, confirmation.Input.IdempotencyKey, requestHash,
+		run.SchemaVersion, run.Mode, run.Question, run.Status, run.PackageID, run.PackageVersion,
+		values.subjectIDs, values.requestedSources, values.routeReasons, values.actualScope, values.budget,
+		run.WaitReason, values.failure, run.Version, run.CreatedAt, run.UpdatedAt,
+		run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt)
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("insert confirmed research run", err)
+	}
+	if err := insertResearchEvent(tx, run.RunID, "", run.Status, ResearchTransition{Code: "run_created", Actor: "orchestrator"}, now); err != nil {
+		return nil, false, classifyResearchPreflightStoreError("insert confirmed research event", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?)`,
+		run.RunID, confirmation.OwnerHash, now); err != nil {
+		return nil, false, classifyResearchPreflightStoreError("bind confirmed research owner", err)
+	}
+	bound, err := tx.Exec(`UPDATE research_preflights SET bound_run_id = ? WHERE preflight_id = ? AND bound_run_id = ''`,
+		run.RunID, preflightID)
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("bind confirmed research preflight", err)
+	}
+	boundCount, err := bound.RowsAffected()
+	if err != nil {
+		return nil, false, classifyResearchPreflightStoreError("read confirmed preflight binding", err)
+	}
+	if boundCount != 1 {
+		return nil, false, ErrResearchPreflightConsumed
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, classifyResearchPreflightStoreError("commit research run confirmation", err)
+	}
+	return run, true, nil
 }
 
 func (s *ResearchStore) LoadResearchPreflightForOwner(preflightID, ownerHash string) (*ResearchPreflight, error) {
@@ -222,11 +529,13 @@ func encodeResearchPreflightPayload(preflight ResearchPreflight) (researchPrefli
 func queryResearchPreflightRecord(queryer researchRowQuerier, preflightID string) (researchPreflightRecord, error) {
 	var record researchPreflightRecord
 	err := queryer.QueryRow(`SELECT preflight_id, owner_hash, request_hash, status,
-		candidates_json, checks_json, gaps_json, parent_run_id, created_at, expires_at
+		candidates_json, checks_json, gaps_json, mode, requested_sources_json, package_constraint,
+		parent_run_id, bound_run_id, created_at, expires_at
 		FROM research_preflights WHERE preflight_id = ?`, preflightID).Scan(
 		&record.preflightID, &record.ownerHash, &record.requestHash, &record.status,
 		&record.candidatesJSON, &record.checksJSON, &record.gapsJSON,
-		&record.parentRunID, &record.createdAt, &record.expiresAt)
+		&record.mode, &record.requestedSourcesJSON, &record.packageConstraint,
+		&record.parentRunID, &record.boundRunID, &record.createdAt, &record.expiresAt)
 	return record, err
 }
 
@@ -330,6 +639,9 @@ func validateResearchPreflightID(value string) error {
 	if value == "" || value != strings.TrimSpace(value) || len([]rune(value)) > researchPreflightIDMaxRunes {
 		return fmt.Errorf("preflight_id is required and must not exceed %d characters", researchPreflightIDMaxRunes)
 	}
+	if !validResearchPreflightResourceID(value) {
+		return fmt.Errorf("preflight_id must be a canonical Research resource ID")
+	}
 	return nil
 }
 
@@ -361,6 +673,13 @@ func classifyResearchPreflightStoreError(operation string, err error) error {
 		ErrResearchPreflightIdempotencyConflict,
 		ErrResearchPreflightUnavailable,
 		ErrResearchPreflightCorrupt,
+		ErrResearchPreflightRequired,
+		ErrResearchPreflightRequestChanged,
+		ErrResearchPreflightCandidate,
+		ErrResearchPreflightPackageChanged,
+		ErrResearchPreflightReadinessChanged,
+		ErrResearchPreflightBlocked,
+		ErrResearchPreflightConsumed,
 	} {
 		if errors.Is(err, sentinel) {
 			return fmt.Errorf("%s: %w", operation, err)
@@ -371,6 +690,15 @@ func classifyResearchPreflightStoreError(operation string, err error) error {
 		return fmt.Errorf("%w: %s: %w", ErrResearchPreflightUnavailable, operation, err)
 	}
 	return fmt.Errorf("%w: %s: %w", ErrResearchPreflightUnavailable, operation, err)
+}
+
+func researchPreflightSQLiteRetryable(err error) bool {
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked ||
+		sqliteErr.Code == sqlite3.ErrConstraint
 }
 
 func corruptResearchPreflightError(operation string, cause error) error {

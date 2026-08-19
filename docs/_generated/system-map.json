@@ -66,7 +66,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 6429,
+      "line": 6507,
       "authenticated": true
     },
     {
@@ -222,13 +222,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 6543,
+      "line": 6621,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 6545,
+      "line": 6623,
       "authenticated": true
     },
     {
@@ -792,7 +792,7 @@
     {
       "path": "/api/research-worker/jobs/",
       "file": "backend/app/kbase_http.go",
-      "line": 5303,
+      "line": 5381,
       "authenticated": true
     },
     {
@@ -804,7 +804,7 @@
     {
       "path": "/api/research-worker/jobs/claim",
       "file": "backend/app/kbase_http.go",
-      "line": 5222,
+      "line": 5300,
       "authenticated": true
     },
     {
@@ -960,7 +960,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 5732,
+      "line": 5810,
       "authenticated": true
     },
     {
@@ -1976,7 +1976,7 @@
     {
       "name": "ResearchRun",
       "file": "backend/app/research_run.go",
-      "line": 67
+      "line": 68
     },
     {
       "name": "ResearchToolAuditRecord",
@@ -2611,7 +2611,7 @@
     {
       "name": "researchPreflightRecord",
       "file": "backend/app/research_preflight_store.go",
-      "line": 37
+      "line": 44
     },
     {
       "name": "sourceAgentDoctorReport",
