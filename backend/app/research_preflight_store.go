@@ -21,6 +21,7 @@ const (
 	researchPreflightJSONMaxBytes         = 64 << 10
 	researchPreflightCleanupMax           = 100
 	researchPreflightStoreTTL             = 10 * time.Minute
+	researchPreflightTimestampLayout      = "2006-01-02T15:04:05.000000000Z"
 )
 
 var (
@@ -105,8 +106,8 @@ func (s *ResearchStore) SaveResearchPreflight(
 	}
 
 	now := s.now().UTC()
-	result.CreatedAt = now.Format(time.RFC3339Nano)
-	result.ExpiresAt = now.Add(ttl).Format(time.RFC3339Nano)
+	result.CreatedAt = formatResearchPreflightTimestamp(now)
+	result.ExpiresAt = formatResearchPreflightTimestamp(now.Add(ttl))
 	_, err = tx.Exec(`INSERT INTO research_preflights (
 		preflight_id, owner_hash, request_hash, status, candidates_json, checks_json, gaps_json,
 		parent_run_id, created_at, expires_at
@@ -155,10 +156,10 @@ func (s *ResearchStore) DeleteExpiredResearchPreflights(limit int) (int, error) 
 	if limit <= 0 || limit > researchPreflightCleanupMax {
 		return 0, fmt.Errorf("research preflight cleanup limit must be between 1 and %d", researchPreflightCleanupMax)
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := formatResearchPreflightTimestamp(s.now())
 	result, err := s.db.Exec(`DELETE FROM research_preflights WHERE preflight_id IN (
 		SELECT preflight_id FROM research_preflights
-		WHERE julianday(expires_at) <= julianday(?)
+		WHERE expires_at <= ?
 		ORDER BY expires_at, preflight_id LIMIT ?
 	)`, now, limit)
 	if err != nil {
@@ -215,7 +216,10 @@ func decodeResearchPreflightRecord(record researchPreflightRecord) (*ResearchPre
 	}
 	createdAt, createdErr := time.Parse(time.RFC3339Nano, record.createdAt)
 	expiresAt, expiresErr := time.Parse(time.RFC3339Nano, record.expiresAt)
-	if createdErr != nil || expiresErr != nil || !expiresAt.After(createdAt) {
+	if createdErr != nil || expiresErr != nil ||
+		record.createdAt != formatResearchPreflightTimestamp(createdAt) ||
+		record.expiresAt != formatResearchPreflightTimestamp(expiresAt) ||
+		!expiresAt.After(createdAt) {
 		return nil, fmt.Errorf("persisted research preflight timestamps are invalid")
 	}
 	preflight := &ResearchPreflight{
@@ -318,6 +322,10 @@ func validResearchPreflightRequestHash(value string) bool {
 func researchPreflightExpired(value string, now time.Time) bool {
 	expiresAt, err := time.Parse(time.RFC3339Nano, value)
 	return err != nil || !expiresAt.After(now.UTC())
+}
+
+func formatResearchPreflightTimestamp(value time.Time) string {
+	return value.UTC().Format(researchPreflightTimestampLayout)
 }
 
 func newResearchPreflightID() string {

@@ -29,7 +29,7 @@ func TestResearchPreflightStoreCreateLoadAndRestartPersistence(t *testing.T) {
 	if !strings.HasPrefix(created.PreflightID, "research-preflight-") || created.RequestHash == "" {
 		t.Fatalf("created identity = %#v", created)
 	}
-	if created.CreatedAt != now.Format(time.RFC3339Nano) || created.ExpiresAt != now.Add(10*time.Minute).Format(time.RFC3339Nano) {
+	if created.CreatedAt != formatResearchPreflightTimestamp(now) || created.ExpiresAt != formatResearchPreflightTimestamp(now.Add(10*time.Minute)) {
 		t.Fatalf("created timestamps = %q to %q", created.CreatedAt, created.ExpiresAt)
 	}
 	loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, "owner-hash-a")
@@ -286,6 +286,41 @@ func TestResearchPreflightStoreCleanupIsBounded(t *testing.T) {
 		if _, err := store.DeleteExpiredResearchPreflights(limit); err == nil || !strings.Contains(err.Error(), "limit") {
 			t.Fatalf("cleanup limit %d error = %v", limit, err)
 		}
+	}
+}
+
+func TestResearchPreflightStoreCleanupPreservesNanosecondExpiryBoundary(t *testing.T) {
+	createdAt := time.Date(2026, 8, 19, 12, 0, 0, 123456789, time.UTC)
+	expiresAt := createdAt.Add(10 * time.Minute)
+	tests := []struct {
+		name    string
+		now     time.Time
+		deleted int
+	}{
+		{name: "one hundred nanoseconds before expiry", now: expiresAt.Add(-100 * time.Nanosecond), deleted: 0},
+		{name: "exactly at expiry", now: expiresAt, deleted: 1},
+		{name: "one hundred nanoseconds after expiry", now: expiresAt.Add(100 * time.Nanosecond), deleted: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := createdAt
+			store, err := OpenResearchStore(t.TempDir(), func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			result := testResearchPreflight()
+			result.PreflightID = "research-preflight-nanosecond-boundary"
+			if _, err := store.SaveResearchPreflight("owner-hash-a", testResearchPreflightStoreRequest(), result, 10*time.Minute); err != nil {
+				t.Fatal(err)
+			}
+
+			now = test.now
+			deleted, err := store.DeleteExpiredResearchPreflights(1)
+			if err != nil || deleted != test.deleted {
+				t.Fatalf("deleted = %d, want %d: %v", deleted, test.deleted, err)
+			}
+		})
 	}
 }
 
