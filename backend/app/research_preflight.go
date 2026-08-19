@@ -44,7 +44,7 @@ type ResearchPreflight struct {
 type ResearchPreflightCandidate struct {
 	PackageID        string   `json:"package_id"`
 	PackageVersion   string   `json:"package_version"`
-	ContentHash      string   `json:"-"`
+	ContentHash      string   `json:"content_hash"`
 	DisplayName      string   `json:"display_name,omitempty"`
 	MatchLevel       string   `json:"match_level"`
 	ReasonCodes      []string `json:"reason_codes,omitempty"`
@@ -168,17 +168,45 @@ func ValidateResearchPreflight(preflight ResearchPreflight) error {
 	if len(preflight.Candidates) > researchPreflightCandidateMax {
 		return fmt.Errorf("candidates exceeds %d items", researchPreflightCandidateMax)
 	}
+	confirmableCandidate := false
+	blockedCandidates := 0
 	for index, candidate := range preflight.Candidates {
+		if strings.TrimSpace(candidate.PackageID) == "" {
+			return fmt.Errorf("candidate %d package_id is required", index)
+		}
+		if strings.TrimSpace(candidate.PackageVersion) == "" {
+			return fmt.Errorf("candidate %d package_version is required", index)
+		}
+		if strings.TrimSpace(candidate.ContentHash) == "" {
+			return fmt.Errorf("candidate %d content_hash is required", index)
+		}
 		if !isResearchPreflightMatchLevel(candidate.MatchLevel) {
 			return fmt.Errorf("candidate %d has unsupported match level %q", index, candidate.MatchLevel)
 		}
 		if !isResearchPreflightCheckStatus(candidate.Readiness) {
 			return fmt.Errorf("candidate %d has unsupported check status %q", index, candidate.Readiness)
 		}
+		switch candidate.Readiness {
+		case ResearchPreflightCheckPass, ResearchPreflightCheckWarning:
+			confirmableCandidate = true
+		case ResearchPreflightCheckBlocked:
+			blockedCandidates++
+		}
+	}
+	if preflight.Status == ResearchPreflightStatusReady {
+		if len(preflight.Candidates) > 0 && blockedCandidates == len(preflight.Candidates) {
+			return fmt.Errorf("ready preflight cannot have all candidates blocked")
+		}
+		if !confirmableCandidate {
+			return fmt.Errorf("ready preflight requires a confirmable candidate")
+		}
 	}
 	for index, check := range preflight.Checks {
 		if !isResearchPreflightCheckStatus(check.Status) {
 			return fmt.Errorf("check %d has unsupported check status %q", index, check.Status)
+		}
+		if preflight.Status == ResearchPreflightStatusReady && check.Status == ResearchPreflightCheckBlocked {
+			return fmt.Errorf("ready preflight cannot contain blocked check %d", index)
 		}
 	}
 	return nil

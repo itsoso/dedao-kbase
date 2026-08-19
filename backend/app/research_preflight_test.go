@@ -107,6 +107,32 @@ func TestValidateResearchPreflightRequestRejectsHardBounds(t *testing.T) {
 	}
 }
 
+func TestValidateResearchPreflightRequestEnforcesParentRunIDBoundary(t *testing.T) {
+	t.Run("exact maximum allowed", func(t *testing.T) {
+		parentRunID := strings.Repeat("r", researchPackageIDMaxRunes)
+		request, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+			Question:    "compare evidence",
+			ParentRunID: parentRunID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.ParentRunID != parentRunID {
+			t.Fatalf("parent_run_id length = %d", len([]rune(request.ParentRunID)))
+		}
+	})
+
+	t.Run("over maximum rejected", func(t *testing.T) {
+		_, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+			Question:    "compare evidence",
+			ParentRunID: strings.Repeat("r", researchPackageIDMaxRunes+1),
+		})
+		if err == nil || !strings.Contains(err.Error(), "parent_run_id exceeds") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
 func TestValidateResearchPreflightRejectsMoreThanThreeCandidates(t *testing.T) {
 	preflight := testResearchPreflight()
 	preflight.Candidates = append(preflight.Candidates,
@@ -133,6 +159,95 @@ func TestValidateResearchPreflightRejectsUnknownDecisionStates(t *testing.T) {
 	}
 }
 
+func TestValidateResearchPreflightEnforcesCandidateAndReadyConsistency(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ResearchPreflight)
+		want   string
+	}{
+		{
+			name: "candidate package id required",
+			mutate: func(preflight *ResearchPreflight) {
+				preflight.Candidates[0].PackageID = "  "
+			},
+			want: "candidate 0 package_id is required",
+		},
+		{
+			name: "candidate package version required",
+			mutate: func(preflight *ResearchPreflight) {
+				preflight.Candidates[0].PackageVersion = ""
+			},
+			want: "candidate 0 package_version is required",
+		},
+		{
+			name: "candidate content hash required",
+			mutate: func(preflight *ResearchPreflight) {
+				preflight.Candidates[0].ContentHash = ""
+			},
+			want: "candidate 0 content_hash is required",
+		},
+		{
+			name: "ready requires candidate",
+			mutate: func(preflight *ResearchPreflight) {
+				preflight.Candidates = nil
+			},
+			want: "ready preflight requires a confirmable candidate",
+		},
+		{
+			name: "ready rejects blocked global check",
+			mutate: func(preflight *ResearchPreflight) {
+				preflight.Checks[0].Status = ResearchPreflightCheckBlocked
+			},
+			want: "ready preflight cannot contain blocked check",
+		},
+		{
+			name: "ready rejects all candidates blocked",
+			mutate: func(preflight *ResearchPreflight) {
+				preflight.Candidates[0].Readiness = ResearchPreflightCheckBlocked
+			},
+			want: "ready preflight cannot have all candidates blocked",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			preflight := testResearchPreflight()
+			test.mutate(&preflight)
+			if err := ValidateResearchPreflight(preflight); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateResearchPreflightAllowsApprovedBlockedAndWarningShapes(t *testing.T) {
+	t.Run("ready warning candidate", func(t *testing.T) {
+		preflight := testResearchPreflight()
+		preflight.Candidates[0].Readiness = ResearchPreflightCheckWarning
+		if err := ValidateResearchPreflight(preflight); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("blocked without candidates", func(t *testing.T) {
+		preflight := testResearchPreflight()
+		preflight.Status = ResearchPreflightStatusBlocked
+		preflight.Candidates = nil
+		if err := ValidateResearchPreflight(preflight); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("blocked with identified candidate", func(t *testing.T) {
+		preflight := testResearchPreflight()
+		preflight.Status = ResearchPreflightStatusBlocked
+		preflight.Candidates[0].Readiness = ResearchPreflightCheckBlocked
+		if err := ValidateResearchPreflight(preflight); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestResearchPreflightProjectionContainsNoPrivateBodies(t *testing.T) {
 	encoded, err := json.Marshal(PublicResearchPreflight(testResearchPreflight()))
 	if err != nil {
@@ -145,6 +260,16 @@ func TestResearchPreflightProjectionContainsNoPrivateBodies(t *testing.T) {
 		if bytes.Contains(encoded, []byte(forbidden)) {
 			t.Fatalf("projection leaks %s", forbidden)
 		}
+	}
+}
+
+func TestResearchPreflightInternalProjectionPreservesContentHash(t *testing.T) {
+	encoded, err := json.Marshal(testResearchPreflight())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"content_hash":"private-content-hash"`)) {
+		t.Fatalf("internal projection lost content hash: %s", encoded)
 	}
 }
 
