@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -77,9 +78,9 @@ type ResearchPreflightGap struct {
 }
 
 // ResearchPreflightPackageFacts contains precomputed, bounded signals for the
-// pure recommendation ranker. RunnablePackageValidated and EvaluationPassed
-// must only be set by trusted upstream package and evaluation gates; neither
-// value may be accepted from a request.
+// pure recommendation ranker. RunnablePackageValidated, EvaluationPassed, and
+// FreshRelease must only be set by trusted upstream package, evaluation, and
+// clock-based freshness gates; none may be accepted from a request.
 type ResearchPreflightPackageFacts struct {
 	Package                  AgentPackage
 	TopicHits                int
@@ -87,6 +88,7 @@ type ResearchPreflightPackageFacts struct {
 	LatestPublishedAt        string
 	RunnablePackageValidated bool
 	EvaluationPassed         bool
+	FreshRelease             bool
 	WorkerState              string
 	BudgetFits               bool
 }
@@ -96,7 +98,9 @@ type researchPreflightRankedCandidate struct {
 	evidenceBucket int
 	topicBucket    int
 	readinessRank  int
-	freshness      string
+	freshness      time.Time
+	workerBlocked  bool
+	budgetBlocked  bool
 }
 
 type PublicResearchPreflightResult struct {
@@ -299,8 +303,6 @@ func RankResearchPreflightCandidates(
 
 	requiresWorker := containsResearchString(normalized.RequestedSources, ResearchSourceChatlog)
 	ranked := make([]researchPreflightRankedCandidate, 0, len(facts))
-	workerBlocked := false
-	budgetBlocked := false
 	for _, packageFacts := range facts {
 		pkg := packageFacts.Package
 		if normalized.PackageConstraint != "" && strings.TrimSpace(pkg.PackageID) != normalized.PackageConstraint {
@@ -313,6 +315,8 @@ func RankResearchPreflightCandidates(
 		readiness := ResearchPreflightCheckPass
 		readinessRank := 2
 		workerReady := false
+		workerBlocked := false
+		budgetBlocked := false
 		if requiresWorker {
 			switch strings.TrimSpace(packageFacts.WorkerState) {
 			case SourceAgentObservedOnline:
@@ -334,11 +338,7 @@ func RankResearchPreflightCandidates(
 
 		evidenceBucket := researchPreflightSignalBucket(packageFacts.EvidenceHits)
 		topicBucket := researchPreflightSignalBucket(packageFacts.TopicHits)
-		latestPublishedAt := strings.TrimSpace(packageFacts.LatestPublishedAt)
-		updatedAt := latestPublishedAt
-		if updatedAt == "" {
-			updatedAt = strings.TrimSpace(pkg.PublishedAt)
-		}
+		updatedAt, freshness := researchPreflightPublishedAt(packageFacts.LatestPublishedAt, pkg.PublishedAt)
 		reasons := make([]string, 0, 5)
 		if evidenceBucket > 0 {
 			reasons = append(reasons, researchPreflightReasonEvidenceCoverage)
@@ -346,7 +346,7 @@ func RankResearchPreflightCandidates(
 		if topicBucket > 0 {
 			reasons = append(reasons, researchPreflightReasonTopicMatch)
 		}
-		if latestPublishedAt != "" {
+		if packageFacts.FreshRelease && !freshness.IsZero() {
 			reasons = append(reasons, researchPreflightReasonFreshRelease)
 		}
 		reasons = append(reasons, researchPreflightReasonTrustedEvaluation)
@@ -377,7 +377,9 @@ func RankResearchPreflightCandidates(
 			evidenceBucket: evidenceBucket,
 			topicBucket:    topicBucket,
 			readinessRank:  readinessRank,
-			freshness:      updatedAt,
+			freshness:      freshness,
+			workerBlocked:  workerBlocked,
+			budgetBlocked:  budgetBlocked,
 		})
 	}
 
@@ -392,8 +394,12 @@ func RankResearchPreflightCandidates(
 		limit = researchPreflightCandidateMax
 	}
 	candidates := make([]ResearchPreflightCandidate, 0, limit)
+	workerBlocked := false
+	budgetBlocked := false
 	for _, item := range ranked[:limit] {
 		candidates = append(candidates, item.candidate)
+		workerBlocked = workerBlocked || item.workerBlocked
+		budgetBlocked = budgetBlocked || item.budgetBlocked
 	}
 
 	gaps := make([]ResearchPreflightGap, 0, 2)
@@ -420,10 +426,66 @@ func researchPreflightPackageEligible(request ResearchPreflightRequest, facts Re
 	if err := validateResearchAgentPackageScope(pkg, request.Mode, request.RequestedSources); err != nil {
 		return false
 	}
+	resolvedMode, _, err := RouteResearchMode(ResearchRunRequest{
+		Mode:             request.Mode,
+		Question:         request.Question,
+		PackageID:        pkg.PackageID,
+		PackageVersion:   pkg.Version,
+		RequestedSources: request.RequestedSources,
+	})
+	if err != nil {
+		return false
+	}
+	if resolvedMode != request.Mode {
+		if err := validateResearchAgentPackageScope(pkg, resolvedMode, request.RequestedSources); err != nil {
+			return false
+		}
+	}
 	if err := validateAgentPackageResearch(*pkg.ResearchPolicy, pkg.ToolPolicy); err != nil {
 		return false
 	}
+	if !researchPreflightAllowsRequestedSourceTools(pkg, request.RequestedSources) {
+		return false
+	}
 	return true
+}
+
+func researchPreflightAllowsRequestedSourceTools(pkg AgentPackage, sources []string) bool {
+	policyTools := stringBoolSet(pkg.ResearchPolicy.AllowedTools...)
+	allowedTools := make(map[string]bool, len(pkg.ToolPolicy.Tools))
+	for _, rule := range pkg.ToolPolicy.Tools {
+		if rule.Decision == AgentToolAllow {
+			allowedTools[strings.TrimSpace(rule.MCPServer)+"/"+strings.TrimSpace(rule.ToolName)] = true
+		}
+	}
+	for _, source := range sources {
+		for _, toolID := range researchPreflightRequiredToolsForSource(source) {
+			if !policyTools[toolID] || !allowedTools[toolID] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func researchPreflightRequiredToolsForSource(source string) []string {
+	switch strings.TrimSpace(source) {
+	case ResearchSourceKnowledge:
+		return []string{
+			"research/" + ResearchToolSearchKnowledge,
+			"research/" + ResearchToolFetchKnowledgeEvidence,
+		}
+	case ResearchSourceChatlog:
+		return []string{
+			"research/" + ResearchWorkerToolSearchChatlog,
+			"research/" + ResearchWorkerToolFetchChatMessage,
+			"research/" + ResearchWorkerToolExpandChatContext,
+		}
+	case ResearchSourcePriorRuns:
+		return []string{"research/" + ResearchToolSearchPriorRuns}
+	default:
+		return nil
+	}
 }
 
 func researchPreflightSignalBucket(hits int) int {
@@ -447,8 +509,8 @@ func researchPreflightCandidateLess(left, right researchPreflightRankedCandidate
 	if left.readinessRank != right.readinessRank {
 		return left.readinessRank > right.readinessRank
 	}
-	if left.freshness != right.freshness {
-		return left.freshness > right.freshness
+	if !left.freshness.Equal(right.freshness) {
+		return left.freshness.After(right.freshness)
 	}
 	leftPackageID := strings.ToLower(strings.TrimSpace(left.candidate.PackageID))
 	rightPackageID := strings.ToLower(strings.TrimSpace(right.candidate.PackageID))
@@ -462,6 +524,24 @@ func researchPreflightCandidateLess(left, right researchPreflightRankedCandidate
 		return left.candidate.ContentHash < right.candidate.ContentHash
 	}
 	return left.candidate.PackageID < right.candidate.PackageID
+}
+
+func researchPreflightPublishedAt(latestPublishedAt, packagePublishedAt string) (string, time.Time) {
+	for _, raw := range []string{latestPublishedAt, packagePublishedAt} {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			parsed, err = time.Parse(time.RFC3339, value)
+		}
+		if err == nil {
+			parsed = parsed.UTC()
+			return parsed.Format(time.RFC3339Nano), parsed
+		}
+	}
+	return "", time.Time{}
 }
 
 func researchPreflightSortedSources(sources []string) []string {

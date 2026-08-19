@@ -330,12 +330,91 @@ func TestResearchPreflightEligibility(t *testing.T) {
 			facts := testResearchPreflightPackageFacts(t, "eligible-agent")
 			if test.mutate != nil {
 				test.mutate(&facts)
+				facts = finalizeResearchPreflightPackageFacts(t, facts)
 			}
 			candidates, _ := RankResearchPreflightCandidates(request, []ResearchPreflightPackageFacts{facts})
 			if len(candidates) != test.want {
 				t.Fatalf("candidate count = %d, want %d: %#v", len(candidates), test.want, candidates)
 			}
 		})
+	}
+}
+
+func TestResearchPreflightEligibilityValidatesAutoResolvedMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		question string
+		sources  []string
+		modes    []string
+	}{
+		{
+			name: "bounded knowledge resolves quick", question: "Summarize the selected collection.",
+			sources: []string{ResearchSourceKnowledge}, modes: []string{ResearchModeAuto, ResearchModeDeep},
+		},
+		{
+			name: "requested auto remains mandatory", question: "Summarize the selected collection.",
+			sources: []string{ResearchSourceKnowledge}, modes: []string{ResearchModeQuick},
+		},
+		{
+			name: "comparison question resolves deep", question: "Compare the two cases.",
+			sources: []string{ResearchSourceKnowledge}, modes: []string{ResearchModeAuto, ResearchModeQuick},
+		},
+		{
+			name: "chatlog source resolves deep", question: "Summarize the discussion.",
+			sources: []string{ResearchSourceChatlog}, modes: []string{ResearchModeAuto, ResearchModeQuick},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			facts := testResearchPreflightPackageFacts(t, "auto-agent")
+			facts.Package.ResearchPolicy.Modes = test.modes
+			facts = finalizeResearchPreflightPackageFacts(t, facts)
+			candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+				Mode: ResearchModeAuto, Question: test.question, RequestedSources: test.sources,
+			}, []ResearchPreflightPackageFacts{facts})
+			if len(candidates) != 0 {
+				t.Fatalf("resolved mode escaped package scope: %#v", candidates)
+			}
+		})
+	}
+}
+
+func TestResearchPreflightEligibilityRequiresMinimumToolsForRequestedSources(t *testing.T) {
+	tests := []struct {
+		name        string
+		source      string
+		missingTool string
+	}{
+		{name: "knowledge search", source: ResearchSourceKnowledge, missingTool: "research/" + ResearchToolSearchKnowledge},
+		{name: "knowledge evidence fetch", source: ResearchSourceKnowledge, missingTool: "research/" + ResearchToolFetchKnowledgeEvidence},
+		{name: "chatlog search", source: ResearchSourceChatlog, missingTool: "research/" + ResearchWorkerToolSearchChatlog},
+		{name: "chatlog message fetch", source: ResearchSourceChatlog, missingTool: "research/" + ResearchWorkerToolFetchChatMessage},
+		{name: "chatlog context expansion", source: ResearchSourceChatlog, missingTool: "research/" + ResearchWorkerToolExpandChatContext},
+		{name: "prior run search", source: ResearchSourcePriorRuns, missingTool: "research/" + ResearchToolSearchPriorRuns},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			facts := testResearchPreflightPackageFacts(t, "source-tool-agent")
+			facts = removeResearchPreflightPackageTool(t, facts, test.missingTool)
+			candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+				Mode: ResearchModeDeep, Question: "Analyze the selected source.", RequestedSources: []string{test.source},
+			}, []ResearchPreflightPackageFacts{facts})
+			if len(candidates) != 0 {
+				t.Fatalf("source remained eligible without %q: %#v", test.missingTool, candidates)
+			}
+		})
+	}
+}
+
+func TestResearchPreflightEligibilityDoesNotRequireChatlogIdentityTools(t *testing.T) {
+	facts := testResearchPreflightPackageFacts(t, "chatlog-tool-agent")
+	facts = removeResearchPreflightPackageTool(t, facts, "research/"+ResearchWorkerToolResolveChatIdentity)
+	facts = removeResearchPreflightPackageTool(t, facts, "research/"+ResearchWorkerToolListIdentityConversations)
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeDeep, Question: "Summarize the selected discussion.", RequestedSources: []string{ResearchSourceChatlog},
+	}, []ResearchPreflightPackageFacts{facts})
+	if len(candidates) != 1 {
+		t.Fatalf("optional identity tools became mandatory: %#v", candidates)
 	}
 }
 
@@ -401,6 +480,31 @@ func TestRankResearchPreflightCandidatesEvidenceCoverageOutranksMetadata(t *test
 	}
 }
 
+func TestRankResearchPreflightCandidatesTreatsNegativeHitsAsZero(t *testing.T) {
+	facts := testResearchPreflightPackageFacts(t, "negative-hits-agent")
+	facts.TopicHits = -2
+	facts.EvidenceHits = -3
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+	}, []ResearchPreflightPackageFacts{facts})
+	if len(candidates) != 1 || candidates[0].MatchLevel != ResearchPreflightMatchLow ||
+		containsResearchString(candidates[0].ReasonCodes, "topic_match") ||
+		containsResearchString(candidates[0].ReasonCodes, "evidence_coverage") {
+		t.Fatalf("negative hit signals = %#v", candidates)
+	}
+}
+
+func TestRankResearchPreflightCandidatesEmptySourcesDoNotRequireWorker(t *testing.T) {
+	facts := testResearchPreflightPackageFacts(t, "empty-source-agent")
+	facts.WorkerState = SourceAgentObservedOffline
+	candidates, gaps := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeAuto, Question: "Summarize the selected collection.",
+	}, []ResearchPreflightPackageFacts{facts})
+	if len(candidates) != 1 || candidates[0].Readiness != ResearchPreflightCheckPass || len(gaps) != 0 {
+		t.Fatalf("empty-source readiness = candidates %#v gaps %#v", candidates, gaps)
+	}
+}
+
 func TestRankResearchPreflightCandidatesReadinessDoesNotChangeEligibility(t *testing.T) {
 	online := testResearchPreflightPackageFacts(t, "online-agent")
 	online.WorkerState = SourceAgentObservedOnline
@@ -431,7 +535,7 @@ func TestRankResearchPreflightCandidatesReadinessDoesNotChangeEligibility(t *tes
 	if !containsResearchString(reasons["online-agent"], "worker_ready") || containsResearchString(reasons["degraded-agent"], "worker_ready") {
 		t.Fatalf("worker reasons = %#v", reasons)
 	}
-	if !researchPreflightGapCodes(gaps)["worker_offline"] || !researchPreflightGapCodes(gaps)["budget_insufficient"] {
+	if researchPreflightGapCodes(gaps)["worker_offline"] || !researchPreflightGapCodes(gaps)["budget_insufficient"] {
 		t.Fatalf("readiness gaps = %#v", gaps)
 	}
 
@@ -443,6 +547,41 @@ func TestRankResearchPreflightCandidatesReadinessDoesNotChangeEligibility(t *tes
 	}, []ResearchPreflightPackageFacts{knowledgeOnly})
 	if len(candidates) != 1 || candidates[0].Readiness != ResearchPreflightCheckPass {
 		t.Fatalf("knowledge-only readiness depended on Worker: %#v", candidates)
+	}
+}
+
+func TestRankResearchPreflightCandidatesGapsOnlyReflectReturnedTopThree(t *testing.T) {
+	passA := testResearchPreflightPackageFacts(t, "pass-a")
+	passB := testResearchPreflightPackageFacts(t, "pass-b")
+	passC := testResearchPreflightPackageFacts(t, "pass-c")
+	blocked := testResearchPreflightPackageFacts(t, "blocked-z")
+	blocked.WorkerState = SourceAgentObservedOffline
+	blocked.BudgetFits = false
+
+	candidates, gaps := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeDeep, Question: "Analyze the selected discussion.", RequestedSources: []string{ResearchSourceChatlog},
+	}, []ResearchPreflightPackageFacts{blocked, passC, passA, passB})
+	if len(candidates) != 3 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	if len(gaps) != 0 {
+		t.Fatalf("excluded candidate leaked gaps: %#v", gaps)
+	}
+}
+
+func TestRankResearchPreflightCandidatesIncludesGapsForReturnedBlockedCandidate(t *testing.T) {
+	blocked := testResearchPreflightPackageFacts(t, "blocked-agent")
+	blocked.WorkerState = "unknown"
+	blocked.BudgetFits = false
+	candidates, gaps := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeDeep, Question: "Analyze the selected discussion.", RequestedSources: []string{ResearchSourceChatlog},
+	}, []ResearchPreflightPackageFacts{blocked})
+	if len(candidates) != 1 || candidates[0].Readiness != ResearchPreflightCheckBlocked {
+		t.Fatalf("blocked candidate = %#v", candidates)
+	}
+	codes := researchPreflightGapCodes(gaps)
+	if !codes["worker_offline"] || !codes["budget_insufficient"] {
+		t.Fatalf("selected candidate gaps = %#v", gaps)
 	}
 }
 
@@ -487,11 +626,73 @@ func TestRankResearchPreflightCandidatesUsesStableTieBreakAndLimit(t *testing.T)
 	}
 }
 
+func TestRankResearchPreflightCandidatesNormalizesAndSortsValidatedFreshness(t *testing.T) {
+	newer := testResearchPreflightPackageFacts(t, "newer-agent")
+	newer.LatestPublishedAt = "2026-08-18T12:00:00-04:00"
+	newer.FreshRelease = true
+	older := testResearchPreflightPackageFacts(t, "older-agent")
+	older.LatestPublishedAt = "2026-08-18T15:30:00Z"
+	older.FreshRelease = true
+
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+	}, []ResearchPreflightPackageFacts{older, newer})
+	if len(candidates) != 2 || candidates[0].PackageID != "newer-agent" {
+		t.Fatalf("freshness order = %#v", candidates)
+	}
+	if candidates[0].UpdatedAt != "2026-08-18T16:00:00Z" || candidates[1].UpdatedAt != "2026-08-18T15:30:00Z" {
+		t.Fatalf("normalized freshness = %#v", candidates)
+	}
+}
+
+func TestRankResearchPreflightCandidatesRejectsUnvalidatedFreshnessText(t *testing.T) {
+	t.Run("invalid latest falls back to valid package publication", func(t *testing.T) {
+		facts := testResearchPreflightPackageFacts(t, "fallback-freshness-agent")
+		facts.LatestPublishedAt = "not-a-time"
+		facts.Package.PublishedAt = "2026-08-18T12:00:00-04:00"
+		facts.FreshRelease = true
+		candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+			Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+		}, []ResearchPreflightPackageFacts{facts})
+		if len(candidates) != 1 || candidates[0].UpdatedAt != "2026-08-18T16:00:00Z" ||
+			!containsResearchString(candidates[0].ReasonCodes, "fresh_release") {
+			t.Fatalf("fallback freshness = %#v", candidates)
+		}
+	})
+
+	t.Run("invalid times are neither exposed nor treated as fresh", func(t *testing.T) {
+		facts := testResearchPreflightPackageFacts(t, "invalid-freshness-agent")
+		facts.LatestPublishedAt = "not-a-time"
+		facts.Package.PublishedAt = "also-not-a-time"
+		facts.FreshRelease = true
+		candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+			Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+		}, []ResearchPreflightPackageFacts{facts})
+		if len(candidates) != 1 || candidates[0].UpdatedAt != "" ||
+			containsResearchString(candidates[0].ReasonCodes, "fresh_release") {
+			t.Fatalf("invalid freshness leaked: %#v", candidates)
+		}
+	})
+
+	t.Run("valid time without trusted freshness fact has no reason", func(t *testing.T) {
+		facts := testResearchPreflightPackageFacts(t, "not-fresh-agent")
+		facts.LatestPublishedAt = "2026-08-18T12:00:00Z"
+		facts.FreshRelease = false
+		candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+			Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+		}, []ResearchPreflightPackageFacts{facts})
+		if len(candidates) != 1 || containsResearchString(candidates[0].ReasonCodes, "fresh_release") {
+			t.Fatalf("untrusted freshness reason = %#v", candidates)
+		}
+	})
+}
+
 func TestRankResearchPreflightCandidatesUsesStableReasonCodesOnly(t *testing.T) {
 	facts := testResearchPreflightPackageFacts(t, "reason-agent")
 	facts.TopicHits = 2
 	facts.EvidenceHits = 3
 	facts.LatestPublishedAt = "2026-08-18T12:00:00Z"
+	facts.FreshRelease = true
 	facts.WorkerState = SourceAgentObservedOnline
 
 	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
@@ -533,6 +734,25 @@ func finalizeResearchPreflightPackageFacts(t *testing.T, facts ResearchPreflight
 	}
 	facts.Package = finalized
 	return facts
+}
+
+func removeResearchPreflightPackageTool(t *testing.T, facts ResearchPreflightPackageFacts, toolID string) ResearchPreflightPackageFacts {
+	t.Helper()
+	allowed := facts.Package.ResearchPolicy.AllowedTools[:0]
+	for _, candidate := range facts.Package.ResearchPolicy.AllowedTools {
+		if candidate != toolID {
+			allowed = append(allowed, candidate)
+		}
+	}
+	facts.Package.ResearchPolicy.AllowedTools = allowed
+	rules := facts.Package.ToolPolicy.Tools[:0]
+	for _, rule := range facts.Package.ToolPolicy.Tools {
+		if strings.TrimSpace(rule.MCPServer)+"/"+strings.TrimSpace(rule.ToolName) != toolID {
+			rules = append(rules, rule)
+		}
+	}
+	facts.Package.ToolPolicy.Tools = rules
+	return finalizeResearchPreflightPackageFacts(t, facts)
 }
 
 func researchPreflightGapCodes(gaps []ResearchPreflightGap) map[string]bool {
