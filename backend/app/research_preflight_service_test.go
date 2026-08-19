@@ -37,6 +37,9 @@ func TestResearchPreflightServiceRanksRealEvidenceAndRedactsBodies(t *testing.T)
 	if result.Status != ResearchPreflightStatusReady || len(result.Candidates) != 2 {
 		t.Fatalf("result = %#v", result)
 	}
+	if err := ValidateResearchPreflight(*result); err != nil {
+		t.Fatalf("ready Evaluate result is not persistable: %v", err)
+	}
 	if embedder.calls != 0 {
 		t.Fatalf("preflight called semantic embedder %d times", embedder.calls)
 	}
@@ -271,6 +274,67 @@ func TestResearchPreflightServiceBoundsBudgetAfterResolvedRoute(t *testing.T) {
 	}
 }
 
+func TestResearchPreflightServiceChecksMixedBudgetsRemainValid(t *testing.T) {
+	fitBudget := ResearchPreflightBudget{
+		ResolvedMode: ResearchModeQuick,
+		Limits: ResearchBudget{
+			MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 2000,
+			MaxModelCalls: 2, MaxCostUSD: 0.5,
+		},
+	}
+	blockedBudget := ResearchPreflightBudget{ResolvedMode: ResearchModeQuick}
+	blocked := ResearchPreflightCandidate{
+		PackageID: "high-evidence-blocked", PackageVersion: "1.0.0", ContentHash: "sha256:blocked",
+		MatchLevel: ResearchPreflightMatchHigh, Readiness: ResearchPreflightCheckBlocked,
+		Coverage: ResearchPreflightCoverage{EvidenceCount: 8}, Budget: blockedBudget,
+	}
+	fit := ResearchPreflightCandidate{
+		PackageID: "lower-evidence-fit", PackageVersion: "1.0.0", ContentHash: "sha256:fit",
+		MatchLevel: ResearchPreflightMatchMedium, Readiness: ResearchPreflightCheckPass,
+		Coverage: ResearchPreflightCoverage{EvidenceCount: 1}, Budget: fitBudget,
+	}
+	details := map[researchPreflightPackageIdentity]researchPreflightCandidateDetail{}
+	for _, entry := range []struct {
+		candidate ResearchPreflightCandidate
+		fits      bool
+	}{
+		{candidate: blocked, fits: false},
+		{candidate: fit, fits: true},
+	} {
+		identity, ok := researchPreflightIdentity(AgentPackage{
+			PackageID: entry.candidate.PackageID, Version: entry.candidate.PackageVersion,
+			ContentHash: entry.candidate.ContentHash,
+		})
+		if !ok {
+			t.Fatalf("invalid test identity: %#v", entry.candidate)
+		}
+		details[identity] = researchPreflightCandidateDetail{
+			budget: entry.candidate.Budget, budgetFits: entry.fits,
+		}
+	}
+
+	for _, candidates := range [][]ResearchPreflightCandidate{{blocked, fit}, {fit, blocked}} {
+		checks := researchPreflightServiceChecks(
+			ResearchPreflightStatusReady, candidates, details, researchPreflightServiceSignals{},
+			[]string{ResearchSourceKnowledge}, ResearchPreflightWorkerNotRequired, ResearchModeQuick,
+		)
+		budget := researchPreflightServiceCheck(checks, "budget")
+		if budget.Status != ResearchPreflightCheckWarning || budget.ResultCode != "candidate_specific" ||
+			budget.NextAction != "review_research_budget" {
+			t.Fatalf("mixed budget check = %#v for candidates %#v", budget, candidates)
+		}
+		for _, check := range checks {
+			if check.Status == ResearchPreflightCheckBlocked {
+				t.Fatalf("ready mixed result has blocked global check: %#v", checks)
+			}
+		}
+		result := ResearchPreflight{Status: ResearchPreflightStatusReady, Candidates: candidates, Checks: checks}
+		if err := ValidateResearchPreflight(result); err != nil {
+			t.Fatalf("mixed result is not persistable: %v; %#v", err, result)
+		}
+	}
+}
+
 func TestResearchPreflightServiceCorruptionBlocksButStorageErrorsRetry(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
@@ -457,6 +521,108 @@ func TestResearchPreflightServiceProbeIsLocalBoundedAndContextAware(t *testing.T
 	})
 }
 
+func TestResearchPreflightServiceBoundsPackageCatalogBeforeEvaluation(t *testing.T) {
+	if researchPreflightPackagePageSize != 100 || researchPreflightPackageMaxPages != 4 ||
+		researchPreflightPackageMaxRecords != 400 {
+		t.Fatalf("catalog limits changed: page_size=%d pages=%d records=%d",
+			researchPreflightPackagePageSize, researchPreflightPackageMaxPages, researchPreflightPackageMaxRecords)
+	}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		prefixCount int
+		wantError   bool
+	}{
+		{name: "candidate is discovered on second page", prefixCount: researchPreflightPackagePageSize},
+		{name: "exact catalog limit completes", prefixCount: researchPreflightPackageMaxRecords - 1},
+		{name: "catalog limit plus one fails before artifact load", prefixCount: researchPreflightPackageMaxRecords, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			knowledge := NewBookKnowledgeStore(t.TempDir())
+			publishResearchPreflightServicePackage(
+				t, knowledge, "catalog-target", "release-catalog", "citation-catalog",
+				"catalog boundary evidence", now, nil,
+			)
+			prependResearchPreflightCatalogRecords(t, knowledge, test.prefixCount)
+			research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+			previous := agentPackageArtifactLoadHook
+			artifactLoads := 0
+			agentPackageArtifactLoadHook = func(context.Context, string) error {
+				artifactLoads++
+				return nil
+			}
+			t.Cleanup(func() { agentPackageArtifactLoadHook = previous })
+
+			result, err := testResearchPreflightService(knowledge, research, nil, now).Evaluate(
+				context.Background(), testResearchPreflightOwnerA, ResearchPreflightRequest{
+					Mode: ResearchModeQuick, Question: "catalog boundary evidence",
+					RequestedSources: []string{ResearchSourceKnowledge},
+				},
+			)
+			if test.wantError {
+				if result != nil || !errors.Is(err, ErrResearchPreflightUnavailable) || artifactLoads != 0 {
+					t.Fatalf("over-limit catalog = %#v, %v, artifact loads=%d", result, err, artifactLoads)
+				}
+				var saved int
+				if countErr := research.db.QueryRow(`SELECT COUNT(*) FROM research_preflights`).Scan(&saved); countErr != nil || saved != 0 {
+					t.Fatalf("saved preflights = %d, %v", saved, countErr)
+				}
+				return
+			}
+			if err != nil || result == nil || result.Status != ResearchPreflightStatusReady ||
+				len(result.Candidates) != 1 || result.Candidates[0].PackageID != "catalog-target" || artifactLoads == 0 {
+				t.Fatalf("bounded catalog result = %#v, %v, artifact loads=%d", result, err, artifactLoads)
+			}
+		})
+	}
+
+	t.Run("duplicate identities across pages fail closed", func(t *testing.T) {
+		first := make([]AgentPackageRecord, researchPreflightPackagePageSize+1)
+		for index := range first {
+			first[index] = researchPreflightCatalogRecord(index)
+		}
+		calls := 0
+		records, err := loadResearchPreflightPackageCatalog(context.Background(), func(after string, limit int) ([]AgentPackageRecord, error) {
+			calls++
+			if calls == 1 {
+				return first, nil
+			}
+			return []AgentPackageRecord{researchPreflightCatalogRecord(50)}, nil
+		})
+		if records != nil || !errors.Is(err, ErrResearchPreflightUnavailable) {
+			t.Fatalf("duplicate catalog = %#v, %v", records, err)
+		}
+	})
+
+	t.Run("repeated cursor page fails closed", func(t *testing.T) {
+		page := make([]AgentPackageRecord, researchPreflightPackagePageSize+1)
+		for index := range page {
+			page[index] = researchPreflightCatalogRecord(index)
+		}
+		records, err := loadResearchPreflightPackageCatalog(context.Background(), func(string, int) ([]AgentPackageRecord, error) {
+			return append([]AgentPackageRecord(nil), page...), nil
+		})
+		if records != nil || !errors.Is(err, ErrResearchPreflightUnavailable) {
+			t.Fatalf("repeated cursor catalog = %#v, %v", records, err)
+		}
+	})
+
+	t.Run("canceled context stops before listing", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		calls := 0
+		records, err := loadResearchPreflightPackageCatalog(ctx, func(string, int) ([]AgentPackageRecord, error) {
+			calls++
+			return nil, nil
+		})
+		if records != nil || !errors.Is(err, context.Canceled) || calls != 0 {
+			t.Fatalf("canceled catalog = %#v, %v, calls=%d", records, err, calls)
+		}
+	})
+}
+
 func testResearchPreflightService(
 	knowledge *BookKnowledgeStore,
 	research *ResearchStore,
@@ -617,6 +783,32 @@ func saveResearchPreflightProbeRelease(
 	}
 	return AgentPackageReleaseRef{
 		ReleaseID: release.ReleaseID, ContentHash: release.ContentHash, CitationIDs: citationIDs,
+	}
+}
+
+func prependResearchPreflightCatalogRecords(t *testing.T, store *BookKnowledgeStore, count int) {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	manifest, err := store.loadAgentPackageManifestUnlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := make([]AgentPackageRecord, count)
+	for index := range prefix {
+		prefix[index] = researchPreflightCatalogRecord(index)
+	}
+	manifest.Packages = append(prefix, manifest.Packages...)
+	if err := store.writeAgentPackageManifestUnlocked(manifest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func researchPreflightCatalogRecord(index int) AgentPackageRecord {
+	return AgentPackageRecord{
+		PackageID: fmt.Sprintf("catalog-draft-%03d", index), Version: "1.0.0",
+		ContentHash:    sha256Fingerprint([]byte(fmt.Sprintf("catalog-draft-%03d", index))),
+		LifecycleState: AgentPackageDraft,
 	}
 }
 

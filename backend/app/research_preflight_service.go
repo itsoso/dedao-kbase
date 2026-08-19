@@ -12,10 +12,13 @@ import (
 )
 
 const (
-	researchPreflightProbeMaxReleases = 8
-	researchPreflightProbeMaxUnits    = 64
-	researchPreflightProbeMaxResults  = 8
-	researchPreflightWorkerFreshness  = 5 * time.Minute
+	researchPreflightProbeMaxReleases  = 8
+	researchPreflightProbeMaxUnits     = 64
+	researchPreflightProbeMaxResults   = 8
+	researchPreflightPackagePageSize   = 100
+	researchPreflightPackageMaxPages   = 4
+	researchPreflightPackageMaxRecords = researchPreflightPackagePageSize * researchPreflightPackageMaxPages
+	researchPreflightWorkerFreshness   = 5 * time.Minute
 )
 
 type ResearchPreflightService struct {
@@ -125,98 +128,162 @@ func (s *ResearchPreflightService) packageFacts(
 	facts := make([]ResearchPreflightPackageFacts, 0)
 	details := make(map[researchPreflightPackageIdentity]researchPreflightCandidateDetail)
 	signals := researchPreflightServiceSignals{}
-	after := ""
-	for {
+	records, err := loadResearchPreflightPackageCatalog(ctx, s.Knowledge.ListAgentPackages)
+	if err != nil {
+		if researchPreflightDependencyRetryable(err) || errors.Is(err, ErrResearchPreflightUnavailable) {
+			return nil, nil, signals, fmt.Errorf("%w: package catalog unavailable", ErrResearchPreflightUnavailable)
+		}
+		signals.packageInvalid++
+		return facts, details, signals, nil
+	}
+	for _, record := range records {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, signals, err
 		}
-		records, err := s.Knowledge.ListAgentPackages(after, 200)
-		if err != nil {
-			if researchPreflightDependencyRetryable(err) {
-				return nil, nil, signals, fmt.Errorf("%w: package store unavailable", ErrResearchPreflightUnavailable)
+		if record.LifecycleState != AgentPackagePublished ||
+			(request.PackageConstraint != "" && record.PackageID != request.PackageConstraint) {
+			continue
+		}
+		pkg, loadErr := s.Knowledge.LoadAgentPackageContext(ctx, record.PackageID, record.Version)
+		if loadErr != nil {
+			if researchPreflightDependencyRetryable(loadErr) {
+				return nil, nil, signals, fmt.Errorf("%w: package artifact unavailable", ErrResearchPreflightUnavailable)
 			}
 			signals.packageInvalid++
-			break
+			continue
 		}
-		for _, record := range records {
-			if record.LifecycleState != AgentPackagePublished ||
-				(request.PackageConstraint != "" && record.PackageID != request.PackageConstraint) {
-				continue
-			}
-			pkg, loadErr := s.Knowledge.LoadAgentPackageContext(ctx, record.PackageID, record.Version)
-			if loadErr != nil {
-				if researchPreflightDependencyRetryable(loadErr) {
-					return nil, nil, signals, fmt.Errorf("%w: package artifact unavailable", ErrResearchPreflightUnavailable)
-				}
-				signals.packageInvalid++
-				continue
-			}
-			if _, _, ok := parseResearchPreflightTime(pkg.PublishedAt); !ok {
-				signals.packageInvalid++
-				continue
-			}
-			if evaluationErr := ValidateAgentPackageEvaluationGate(s.Knowledge, *pkg); evaluationErr != nil {
-				if researchPreflightDependencyRetryable(evaluationErr) {
-					return nil, nil, signals, fmt.Errorf("%w: evaluation store unavailable", ErrResearchPreflightUnavailable)
-				}
-				signals.evaluationInvalid++
-				continue
-			}
-			// LoadAgentPackageContext has already validated the exact published
-			// artifact, content hash, runtime descriptor, releases, and package
-			// contract. Keep the remaining runnable checks local so a second
-			// Store read cannot erase a retryable I/O cause.
-			if pkg.LifecycleState != AgentPackagePublished ||
-				!agentPackageHasCapability(*pkg, "search") ||
-				validateResearchAgentPackageScope(*pkg, resolvedMode, request.RequestedSources) != nil {
-				signals.scopeRejected++
-				continue
-			}
-			runnable := pkg
-			probe, searchErr := researchPreflightProbeEvidence(
-				ctx, s.Knowledge, *runnable, request.Question,
-			)
-			if searchErr != nil {
-				if researchPreflightDependencyRetryable(searchErr) {
-					return nil, nil, signals, fmt.Errorf("%w: knowledge search unavailable", ErrResearchPreflightUnavailable)
-				}
-				signals.coverageInvalid++
-				continue
-			}
-			coverage := researchPreflightCoverage(probe)
-			probe = nil
-			serverBudget := s.QuickBudget
-			if resolvedMode == ResearchModeDeep {
-				serverBudget = s.DeepBudget
-			}
-			boundedBudget := boundResearchBudgetByPolicy(serverBudget, *runnable.ResearchPolicy)
-			budget := ResearchPreflightBudget{ResolvedMode: resolvedMode, Limits: boundedBudget}
-			budgetFits := researchPreflightBudgetFits(budget)
-			identity, ok := researchPreflightIdentity(*runnable)
-			if !ok {
-				signals.packageInvalid++
-				continue
-			}
-			details[identity] = researchPreflightCandidateDetail{
-				coverage: coverage, budget: budget, budgetFits: budgetFits,
-			}
-			facts = append(facts, ResearchPreflightPackageFacts{
-				Package: *runnable, TopicHits: researchPreflightTopicHits(request.Question, *runnable),
-				EvidenceHits: coverage.EvidenceCount, LatestPublishedAt: runnable.PublishedAt,
-				RunnablePackageValidated: true, EvaluationPassed: true,
-				WorkerState: workerRankState, BudgetFits: budgetFits,
-			})
+		if _, _, ok := parseResearchPreflightTime(pkg.PublishedAt); !ok {
+			signals.packageInvalid++
+			continue
 		}
-		if len(records) < 200 {
-			break
+		if evaluationErr := ValidateAgentPackageEvaluationGate(s.Knowledge, *pkg); evaluationErr != nil {
+			if researchPreflightDependencyRetryable(evaluationErr) {
+				return nil, nil, signals, fmt.Errorf("%w: evaluation store unavailable", ErrResearchPreflightUnavailable)
+			}
+			signals.evaluationInvalid++
+			continue
 		}
-		next := agentPackageReference(records[len(records)-1].PackageID, records[len(records)-1].Version)
-		if next == after {
-			return nil, nil, signals, fmt.Errorf("%w: package pagination did not advance", ErrResearchPreflightUnavailable)
+		// LoadAgentPackageContext has already validated the exact published
+		// artifact, content hash, runtime descriptor, releases, and package
+		// contract. Keep the remaining runnable checks local so a second
+		// Store read cannot erase a retryable I/O cause.
+		if pkg.LifecycleState != AgentPackagePublished ||
+			!agentPackageHasCapability(*pkg, "search") ||
+			validateResearchAgentPackageScope(*pkg, resolvedMode, request.RequestedSources) != nil {
+			signals.scopeRejected++
+			continue
 		}
-		after = next
+		runnable := pkg
+		probe, searchErr := researchPreflightProbeEvidence(
+			ctx, s.Knowledge, *runnable, request.Question,
+		)
+		if searchErr != nil {
+			if researchPreflightDependencyRetryable(searchErr) {
+				return nil, nil, signals, fmt.Errorf("%w: knowledge search unavailable", ErrResearchPreflightUnavailable)
+			}
+			signals.coverageInvalid++
+			continue
+		}
+		coverage := researchPreflightCoverage(probe)
+		probe = nil
+		serverBudget := s.QuickBudget
+		if resolvedMode == ResearchModeDeep {
+			serverBudget = s.DeepBudget
+		}
+		boundedBudget := boundResearchBudgetByPolicy(serverBudget, *runnable.ResearchPolicy)
+		budget := ResearchPreflightBudget{ResolvedMode: resolvedMode, Limits: boundedBudget}
+		budgetFits := researchPreflightBudgetFits(budget)
+		identity, ok := researchPreflightIdentity(*runnable)
+		if !ok {
+			signals.packageInvalid++
+			continue
+		}
+		details[identity] = researchPreflightCandidateDetail{
+			coverage: coverage, budget: budget, budgetFits: budgetFits,
+		}
+		facts = append(facts, ResearchPreflightPackageFacts{
+			Package: *runnable, TopicHits: researchPreflightTopicHits(request.Question, *runnable),
+			EvidenceHits: coverage.EvidenceCount, LatestPublishedAt: runnable.PublishedAt,
+			RunnablePackageValidated: true, EvaluationPassed: true,
+			WorkerState: workerRankState, BudgetFits: budgetFits,
+		})
 	}
 	return facts, details, signals, nil
+}
+
+type researchPreflightPackageListFunc func(after string, limit int) ([]AgentPackageRecord, error)
+
+func loadResearchPreflightPackageCatalog(
+	ctx context.Context,
+	list researchPreflightPackageListFunc,
+) ([]AgentPackageRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if list == nil {
+		return nil, fmt.Errorf("%w: package catalog list function is required", ErrResearchPreflightUnavailable)
+	}
+	records := make([]AgentPackageRecord, 0, researchPreflightPackageMaxRecords)
+	seenRecords := make(map[string]bool, researchPreflightPackageMaxRecords)
+	seenCursors := make(map[string]bool, researchPreflightPackageMaxPages)
+	after := ""
+	for page := 0; page < researchPreflightPackageMaxPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pageRecords, err := list(after, researchPreflightPackagePageSize+1)
+		if err != nil {
+			return nil, err
+		}
+		if len(pageRecords) > researchPreflightPackagePageSize+1 {
+			return nil, fmt.Errorf("%w: package catalog page exceeded requested limit", ErrResearchPreflightUnavailable)
+		}
+		if len(pageRecords) == 0 {
+			return records, nil
+		}
+		pageSeen := make(map[string]bool, len(pageRecords))
+		for _, record := range pageRecords {
+			identity, ok := researchPreflightCatalogRecordIdentity(record)
+			if !ok || pageSeen[identity] || seenRecords[identity] {
+				return nil, fmt.Errorf("%w: malformed or overlapping package catalog", ErrResearchPreflightUnavailable)
+			}
+			pageSeen[identity] = true
+		}
+		hasMore := len(pageRecords) > researchPreflightPackagePageSize
+		if hasMore {
+			pageRecords = pageRecords[:researchPreflightPackagePageSize]
+		}
+		if len(records)+len(pageRecords) > researchPreflightPackageMaxRecords {
+			return nil, fmt.Errorf("%w: package catalog record limit exceeded", ErrResearchPreflightUnavailable)
+		}
+		for _, record := range pageRecords {
+			identity, _ := researchPreflightCatalogRecordIdentity(record)
+			seenRecords[identity] = true
+		}
+		records = append(records, pageRecords...)
+		if !hasMore {
+			return records, nil
+		}
+		if page+1 >= researchPreflightPackageMaxPages {
+			return nil, fmt.Errorf("%w: package catalog page limit exceeded", ErrResearchPreflightUnavailable)
+		}
+		next, _ := researchPreflightCatalogRecordIdentity(pageRecords[len(pageRecords)-1])
+		if next == after || seenCursors[next] {
+			return nil, fmt.Errorf("%w: package catalog cursor did not advance", ErrResearchPreflightUnavailable)
+		}
+		seenCursors[next] = true
+		after = next
+	}
+	return nil, fmt.Errorf("%w: package catalog page limit exceeded", ErrResearchPreflightUnavailable)
+}
+
+func researchPreflightCatalogRecordIdentity(record AgentPackageRecord) (string, bool) {
+	packageID := strings.TrimSpace(record.PackageID)
+	version := strings.TrimSpace(record.Version)
+	if packageID == "" || version == "" {
+		return "", false
+	}
+	return agentPackageReference(packageID, version), true
 }
 
 // researchPreflightProbeEvidence performs a local lexical-only probe. V4
@@ -457,15 +524,22 @@ func researchPreflightServiceChecks(
 	})
 	budgetStatus := ResearchPreflightCheckBlocked
 	budgetResult := "insufficient"
-	if len(candidates) > 0 {
+	budgetFitCount := 0
+	for _, candidate := range candidates {
 		identity, ok := researchPreflightIdentity(AgentPackage{
-			PackageID: candidates[0].PackageID, Version: candidates[0].PackageVersion,
-			ContentHash: candidates[0].ContentHash,
+			PackageID: candidate.PackageID, Version: candidate.PackageVersion,
+			ContentHash: candidate.ContentHash,
 		})
 		if ok && details[identity].budgetFits {
-			budgetStatus = ResearchPreflightCheckPass
-			budgetResult = "resolved_" + resolvedMode
+			budgetFitCount++
 		}
+	}
+	if len(candidates) > 0 && budgetFitCount == len(candidates) {
+		budgetStatus = ResearchPreflightCheckPass
+		budgetResult = "resolved_" + resolvedMode
+	} else if budgetFitCount > 0 {
+		budgetStatus = ResearchPreflightCheckWarning
+		budgetResult = "candidate_specific"
 	}
 	checks = append(checks, ResearchPreflightCheck{
 		Code: "budget", Status: budgetStatus, ResultCode: budgetResult,
