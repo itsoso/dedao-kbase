@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -418,6 +419,35 @@ func TestResearchPreflightEligibilityDoesNotRequireChatlogIdentityTools(t *testi
 	}
 }
 
+func TestResearchPreflightRequiredToolBindingsUseCentralCatalog(t *testing.T) {
+	tests := []struct {
+		source string
+		want   []string
+	}{
+		{source: ResearchSourceKnowledge, want: []string{
+			"research/" + ResearchToolSearchKnowledge,
+			"research/" + ResearchToolFetchKnowledgeEvidence,
+		}},
+		{source: ResearchSourceChatlog, want: []string{
+			"research/" + ResearchWorkerToolSearchChatlog,
+			"research/" + ResearchWorkerToolFetchChatMessage,
+			"research/" + ResearchWorkerToolExpandChatContext,
+		}},
+		{source: ResearchSourcePriorRuns, want: []string{"research/" + ResearchToolSearchPriorRuns}},
+	}
+	for _, test := range tests {
+		t.Run(test.source, func(t *testing.T) {
+			got, ok := researchPreflightRequiredToolBindings(test.source)
+			if !ok || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("bindings for %q = %#v ok=%t, want %#v", test.source, got, ok, test.want)
+			}
+		})
+	}
+	if got, ok := researchPreflightRequiredToolBindings("unknown"); ok || got != nil {
+		t.Fatalf("unknown source bindings = %#v ok=%t", got, ok)
+	}
+}
+
 func TestResearchPreflightEligibilityExplicitConstraintNeverWidens(t *testing.T) {
 	eligible := testResearchPreflightPackageFacts(t, "eligible-agent")
 	ineligible := testResearchPreflightPackageFacts(t, "constrained-agent")
@@ -585,6 +615,66 @@ func TestRankResearchPreflightCandidatesIncludesGapsForReturnedBlockedCandidate(
 	}
 }
 
+func TestRankResearchPreflightCandidatesRejectsConflictingSameIdentityFactsDeterministically(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ResearchPreflightPackageFacts)
+	}{
+		{name: "freshness conflict", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.LatestPublishedAt = "2026-08-18T12:00:00Z"
+			facts.FreshRelease = true
+		}},
+		{name: "worker conflict", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.WorkerState = SourceAgentObservedOffline
+		}},
+		{name: "budget conflict", mutate: func(facts *ResearchPreflightPackageFacts) {
+			facts.BudgetFits = false
+		}},
+	}
+	request := ResearchPreflightRequest{
+		Mode: ResearchModeDeep, Question: "Analyze the selected discussion.", RequestedSources: []string{ResearchSourceChatlog},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := testResearchPreflightPackageFacts(t, "conflict-agent")
+			conflict := original
+			test.mutate(&conflict)
+			stable := testResearchPreflightPackageFacts(t, "stable-agent")
+
+			firstCandidates, firstGaps := RankResearchPreflightCandidates(request, []ResearchPreflightPackageFacts{original, conflict, stable})
+			secondCandidates, secondGaps := RankResearchPreflightCandidates(request, []ResearchPreflightPackageFacts{stable, conflict, original})
+			if !reflect.DeepEqual(firstCandidates, secondCandidates) || !reflect.DeepEqual(firstGaps, secondGaps) {
+				t.Fatalf("same-identity conflict depended on input order: %#v/%#v versus %#v/%#v", firstCandidates, firstGaps, secondCandidates, secondGaps)
+			}
+			if len(firstCandidates) != 1 || firstCandidates[0].PackageID != "stable-agent" || len(firstGaps) != 0 {
+				t.Fatalf("conflicting identity was not excluded: candidates %#v gaps %#v", firstCandidates, firstGaps)
+			}
+		})
+	}
+}
+
+func TestRankResearchPreflightCandidatesDeduplicatesIdenticalSameIdentityFacts(t *testing.T) {
+	facts := testResearchPreflightPackageFacts(t, "duplicate-agent")
+	candidates, gaps := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+	}, []ResearchPreflightPackageFacts{facts, facts})
+	if len(candidates) != 1 || candidates[0].PackageID != "duplicate-agent" || len(gaps) != 0 {
+		t.Fatalf("identical identity was not deduplicated: candidates %#v gaps %#v", candidates, gaps)
+	}
+}
+
+func TestRankResearchPreflightCandidatesReturnsNoEligibleGapForOnlyConflictingIdentity(t *testing.T) {
+	original := testResearchPreflightPackageFacts(t, "conflict-agent")
+	conflict := original
+	conflict.BudgetFits = false
+	candidates, gaps := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+	}, []ResearchPreflightPackageFacts{original, conflict})
+	if len(candidates) != 0 || len(gaps) != 1 || gaps[0].Code != "no_eligible_package" {
+		t.Fatalf("only conflicting identity = candidates %#v gaps %#v", candidates, gaps)
+	}
+}
+
 func TestRankResearchPreflightCandidatesUsesStableTieBreakAndLimit(t *testing.T) {
 	alphaV2 := testResearchPreflightPackageFacts(t, "alpha-agent")
 	alphaV2.Package.Version = "2.0.0"
@@ -655,7 +745,7 @@ func TestRankResearchPreflightCandidatesRejectsUnvalidatedFreshnessText(t *testi
 			Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
 		}, []ResearchPreflightPackageFacts{facts})
 		if len(candidates) != 1 || candidates[0].UpdatedAt != "2026-08-18T16:00:00Z" ||
-			!containsResearchString(candidates[0].ReasonCodes, "fresh_release") {
+			containsResearchString(candidates[0].ReasonCodes, "fresh_release") {
 			t.Fatalf("fallback freshness = %#v", candidates)
 		}
 	})
@@ -685,6 +775,32 @@ func TestRankResearchPreflightCandidatesRejectsUnvalidatedFreshnessText(t *testi
 			t.Fatalf("untrusted freshness reason = %#v", candidates)
 		}
 	})
+}
+
+func TestRankResearchPreflightCandidatesBindsFreshnessSignalToTrustedLatestTime(t *testing.T) {
+	trustedLatest := testResearchPreflightPackageFacts(t, "z-trusted-latest")
+	trustedLatest.LatestPublishedAt = "2026-08-17T12:00:00Z"
+	trustedLatest.FreshRelease = true
+	untrustedLatest := testResearchPreflightPackageFacts(t, "a-untrusted-latest")
+	untrustedLatest.LatestPublishedAt = "2026-08-19T12:00:00Z"
+	untrustedLatest.FreshRelease = false
+	fallbackOnly := testResearchPreflightPackageFacts(t, "b-fallback-only")
+	fallbackOnly.LatestPublishedAt = "not-a-time"
+	fallbackOnly.Package.PublishedAt = "2026-08-20T12:00:00Z"
+	fallbackOnly.FreshRelease = true
+
+	candidates, _ := RankResearchPreflightCandidates(ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "Summarize the selected collection.",
+	}, []ResearchPreflightPackageFacts{fallbackOnly, untrustedLatest, trustedLatest})
+	if len(candidates) != 3 || candidates[0].PackageID != "z-trusted-latest" ||
+		candidates[1].PackageID != "a-untrusted-latest" || candidates[2].PackageID != "b-fallback-only" {
+		t.Fatalf("freshness signal order = %#v", candidates)
+	}
+	if !containsResearchString(candidates[0].ReasonCodes, "fresh_release") ||
+		containsResearchString(candidates[1].ReasonCodes, "fresh_release") ||
+		containsResearchString(candidates[2].ReasonCodes, "fresh_release") {
+		t.Fatalf("freshness signal reasons = %#v", candidates)
+	}
 }
 
 func TestRankResearchPreflightCandidatesUsesStableReasonCodesOnly(t *testing.T) {
