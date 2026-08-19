@@ -2,7 +2,6 @@ package app
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -17,7 +16,7 @@ import (
 const (
 	researchPreflightRequestSchemaVersion = "research-preflight-request/v1"
 	researchPreflightIDMaxRunes           = 128
-	researchPreflightOwnerHashMaxRunes    = 128
+	researchPreflightOwnerHashMaxRunes    = 64
 	researchPreflightJSONMaxBytes         = 64 << 10
 	researchPreflightCleanupMax           = 100
 	researchPreflightStoreTTL             = 10 * time.Minute
@@ -59,7 +58,10 @@ func (s *ResearchStore) SaveResearchPreflight(
 	}
 	result.PreflightID = strings.TrimSpace(result.PreflightID)
 	if result.PreflightID == "" {
-		result.PreflightID = newResearchPreflightID()
+		result.PreflightID, err = newResearchPreflightID(s.random)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := validateResearchPreflightID(result.PreflightID); err != nil {
 		return nil, err
@@ -73,55 +75,69 @@ func (s *ResearchStore) SaveResearchPreflight(
 	if err != nil {
 		return nil, err
 	}
+	now := s.now().UTC()
+	result.CreatedAt = formatResearchPreflightTimestamp(now)
+	result.ExpiresAt = formatResearchPreflightTimestamp(now.Add(ttl))
 
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	record, err := queryResearchPreflightRecord(tx, result.PreflightID)
-	if err == nil {
-		if record.ownerHash != ownerHash {
-			return nil, ErrResearchPreflightOwner
-		}
-		existing, err := decodeResearchPreflightRecord(record)
-		if err != nil {
-			return nil, err
-		}
-		if researchPreflightExpired(existing.ExpiresAt, s.now()) {
-			return nil, ErrResearchPreflightExpired
-		}
-		if existing.RequestHash != requestHash {
-			return nil, ErrResearchPreflightIdempotencyConflict
-		}
-		if existing.Status != result.Status || existing.ParentRunID != result.ParentRunID ||
-			record.candidatesJSON != incoming.candidatesJSON ||
-			record.checksJSON != incoming.checksJSON || record.gapsJSON != incoming.gapsJSON {
-			return nil, ErrResearchPreflightIdempotencyConflict
-		}
-		return existing, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-
-	now := s.now().UTC()
-	result.CreatedAt = formatResearchPreflightTimestamp(now)
-	result.ExpiresAt = formatResearchPreflightTimestamp(now.Add(ttl))
-	_, err = tx.Exec(`INSERT INTO research_preflights (
+	inserted, err := tx.Exec(`INSERT INTO research_preflights (
 		preflight_id, owner_hash, request_hash, status, candidates_json, checks_json, gaps_json,
 		parent_run_id, created_at, expires_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(preflight_id) DO NOTHING`,
 		result.PreflightID, ownerHash, result.RequestHash, result.Status,
 		incoming.candidatesJSON, incoming.checksJSON, incoming.gapsJSON,
 		result.ParentRunID, result.CreatedAt, result.ExpiresAt)
 	if err != nil {
 		return nil, err
 	}
+	insertedCount, err := inserted.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if insertedCount == 1 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return &result, nil
+	}
+	if insertedCount != 0 {
+		return nil, fmt.Errorf("research preflight insert returned an invalid row count")
+	}
+
+	record, err := queryResearchPreflightRecord(tx, result.PreflightID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResearchPreflightOwnerHash(record.ownerHash); err != nil {
+		return nil, fmt.Errorf("persisted research preflight owner is invalid")
+	}
+	if record.ownerHash != ownerHash {
+		return nil, ErrResearchPreflightOwner
+	}
+	existing, err := decodeResearchPreflightRecord(record)
+	if err != nil {
+		return nil, err
+	}
+	if researchPreflightExpired(existing.ExpiresAt, s.now()) {
+		return nil, ErrResearchPreflightExpired
+	}
+	if existing.RequestHash != requestHash {
+		return nil, ErrResearchPreflightIdempotencyConflict
+	}
+	if existing.Status != result.Status || existing.ParentRunID != result.ParentRunID ||
+		record.candidatesJSON != incoming.candidatesJSON ||
+		record.checksJSON != incoming.checksJSON || record.gapsJSON != incoming.gapsJSON {
+		return nil, ErrResearchPreflightIdempotencyConflict
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &result, nil
+	return existing, nil
 }
 
 func (s *ResearchStore) LoadResearchPreflightForOwner(preflightID, ownerHash string) (*ResearchPreflight, error) {
@@ -138,6 +154,9 @@ func (s *ResearchStore) LoadResearchPreflightForOwner(preflightID, ownerHash str
 	}
 	if err != nil {
 		return nil, err
+	}
+	if err := validateResearchPreflightOwnerHash(record.ownerHash); err != nil {
+		return nil, fmt.Errorf("persisted research preflight owner is invalid")
 	}
 	if record.ownerHash != ownerHash {
 		return nil, ErrResearchPreflightOwner
@@ -219,7 +238,7 @@ func decodeResearchPreflightRecord(record researchPreflightRecord) (*ResearchPre
 	if createdErr != nil || expiresErr != nil ||
 		record.createdAt != formatResearchPreflightTimestamp(createdAt) ||
 		record.expiresAt != formatResearchPreflightTimestamp(expiresAt) ||
-		!expiresAt.After(createdAt) {
+		expiresAt.Sub(createdAt) != researchPreflightStoreTTL {
 		return nil, fmt.Errorf("persisted research preflight timestamps are invalid")
 	}
 	preflight := &ResearchPreflight{
@@ -308,8 +327,9 @@ func validateResearchPreflightID(value string) error {
 }
 
 func validateResearchPreflightOwnerHash(value string) error {
-	if value == "" || value != strings.TrimSpace(value) || len([]rune(value)) > researchPreflightOwnerHashMaxRunes {
-		return fmt.Errorf("owner_hash is required and must not exceed %d characters", researchPreflightOwnerHashMaxRunes)
+	raw, err := hex.DecodeString(value)
+	if len(value) != researchPreflightOwnerHashMaxRunes || value != strings.ToLower(value) || err != nil || len(raw) != sha256.Size {
+		return fmt.Errorf("owner_hash must be a lowercase SHA-256 digest")
 	}
 	return nil
 }
@@ -328,11 +348,10 @@ func formatResearchPreflightTimestamp(value time.Time) string {
 	return value.UTC().Format(researchPreflightTimestampLayout)
 }
 
-func newResearchPreflightID() string {
+func newResearchPreflightID(reader io.Reader) (string, error) {
 	var randomBytes [16]byte
-	if _, err := rand.Read(randomBytes[:]); err != nil {
-		digest := sha256.Sum256([]byte(time.Now().UTC().Format(time.RFC3339Nano)))
-		copy(randomBytes[:], digest[:16])
+	if _, err := io.ReadFull(reader, randomBytes[:]); err != nil {
+		return "", fmt.Errorf("generate research preflight random id: %w", err)
 	}
-	return "research-preflight-" + hex.EncodeToString(randomBytes[:])
+	return "research-preflight-" + hex.EncodeToString(randomBytes[:]), nil
 }

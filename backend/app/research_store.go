@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,7 @@ type ResearchEvent struct {
 type ResearchStore struct {
 	dbPath string
 	now    func() time.Time
+	random io.Reader
 	db     *sql.DB
 }
 
@@ -92,7 +94,7 @@ func OpenResearchStore(root string, now func() time.Time) (*ResearchStore, error
 		_ = db.Close()
 		return nil, err
 	}
-	return &ResearchStore{dbPath: dbPath, now: now, db: db}, nil
+	return &ResearchStore{dbPath: dbPath, now: now, random: rand.Reader, db: db}, nil
 }
 
 func (s *ResearchStore) Close() error {
