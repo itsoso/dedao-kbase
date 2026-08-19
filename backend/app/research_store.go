@@ -220,6 +220,19 @@ func migrateResearchStore(db *sql.DB) error {
 			PRIMARY KEY (request_identity, attempt)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_research_model_attempts_run ON research_model_invocation_attempts(run_id, status, updated_at)`,
+		`CREATE TABLE IF NOT EXISTS research_preflights (
+			preflight_id TEXT PRIMARY KEY,
+			owner_hash TEXT NOT NULL,
+			request_hash TEXT NOT NULL,
+			status TEXT NOT NULL,
+			candidates_json TEXT NOT NULL,
+			checks_json TEXT NOT NULL,
+			gaps_json TEXT NOT NULL,
+			parent_run_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_preflights_owner_expiry ON research_preflights(owner_hash, expires_at, preflight_id)`,
 		`CREATE TABLE IF NOT EXISTS research_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`INSERT OR IGNORE INTO research_meta(key, value) VALUES ('schema_version', '1')`,
 	}
