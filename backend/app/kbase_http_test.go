@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2830,6 +2831,244 @@ func TestKBaseHTTPResearchRunValidationAndMethods(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestKBaseHTTPResearchPreflightBearerReadyAndRedaction(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(
+		t, knowledge, "http-ready-agent", "release-http-ready", "citation-http-ready",
+		"private-http-preflight-evidence", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, nil))
+	body := `{"mode":"quick","question":"private-http-preflight-evidence","requested_sources":["knowledge"]}`
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "", body)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret", body)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload PublicResearchPreflightResult
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode preflight: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Status != ResearchPreflightStatusReady || payload.PreflightID == "" || payload.ExpiresAt == "" ||
+		len(payload.Candidates) != 1 || payload.Candidates[0].PackageID != pkg.PackageID ||
+		payload.Candidates[0].Readiness != ResearchPreflightCheckPass {
+		t.Fatalf("ready preflight = %#v", payload)
+	}
+	ownerDigest := sha256.Sum256([]byte("bearer:kbase"))
+	if stored, err := research.LoadResearchPreflightForOwner(payload.PreflightID, hex.EncodeToString(ownerDigest[:])); err != nil || stored.Status != ResearchPreflightStatusReady {
+		t.Fatalf("stored bearer preflight = %#v, %v", stored, err)
+	}
+	for _, forbidden := range []string{
+		"private-http-preflight-evidence", "citation-http-ready", "content_hash", "request_hash",
+		"message_ref", "local_path", "identity_id", research.dbPath, knowledge.Root(),
+	} {
+		if forbidden != "" && strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("preflight response leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+}
+
+func TestKBaseHTTPResearchPreflightBrowserSessionCSRFAndOwnerIsolation(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	clock := &browserSessionTestClock{now: now}
+	_, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 919)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	config := researchPreflightHTTPTestConfig(knowledge, research, nil)
+	config.BrowserSessionSecret = testBrowserSessionSecret
+	config.BrowserSessions = BrowserSessionHTTPConfig{
+		Store: sessionStore, PublicOrigin: testBrowserSessionOrigin,
+		TTL: testBrowserSessionCookieTTL, RenewalInterval: 5 * time.Minute, MaxActive: 10,
+	}
+	handler := NewKBaseHTTPHandler(config)
+	first := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Preflight Browser One")
+	second := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Preflight Browser Two")
+	firstCSRF, _ := loadKBaseBrowserSessionCSRF(t, handler, first.Token)
+	secondCSRF, _ := loadKBaseBrowserSessionCSRF(t, handler, second.Token)
+	body := `{"mode":"quick","question":"browser owner isolation","requested_sources":["knowledge"]}`
+
+	missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/preflight", first.Token, body)
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missingCSRF)
+	if missingResponse.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
+	}
+
+	create := func(credentials BrowserSessionCredentials, csrf string) PublicResearchPreflightResult {
+		t.Helper()
+		request := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/preflight", credentials.Token, body)
+		addKBaseBrowserSessionSecurityHeaders(request, csrf)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("cookie preflight status=%d body=%s", response.Code, response.Body.String())
+		}
+		var payload PublicResearchPreflightResult
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode cookie preflight: %v", err)
+		}
+		return payload
+	}
+	firstPreflight := create(first, firstCSRF)
+	secondPreflight := create(second, secondCSRF)
+	if firstPreflight.PreflightID == secondPreflight.PreflightID {
+		t.Fatalf("sessions shared preflight id %q", firstPreflight.PreflightID)
+	}
+	firstOwner := sha256.Sum256([]byte("session:" + first.Session.ID))
+	secondOwner := sha256.Sum256([]byte("session:" + second.Session.ID))
+	if stored, err := research.LoadResearchPreflightForOwner(firstPreflight.PreflightID, hex.EncodeToString(firstOwner[:])); err != nil || stored == nil {
+		t.Fatalf("first owner load = %#v, %v", stored, err)
+	}
+	if stored, err := research.LoadResearchPreflightForOwner(firstPreflight.PreflightID, hex.EncodeToString(secondOwner[:])); stored != nil || !errors.Is(err, ErrResearchPreflightOwner) {
+		t.Fatalf("foreign owner load = %#v, %v", stored, err)
+	}
+}
+
+func TestKBaseHTTPResearchPreflightBlockedResponse(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	publishResearchPreflightServicePackage(
+		t, knowledge, "http-blocked-agent", "release-http-blocked", "citation-http-blocked",
+		"private-http-blocked-evidence", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, nil))
+	response := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret",
+		`{"mode":"quick","question":"private-http-blocked-evidence","requested_sources":["knowledge","chatlog"]}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload PublicResearchPreflightResult
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Status != ResearchPreflightStatusBlocked || len(payload.Candidates) != 1 ||
+		payload.Candidates[0].Readiness != ResearchPreflightCheckBlocked ||
+		researchPreflightServiceCheckPublic(payload.Checks, "worker").Status != ResearchPreflightCheckBlocked {
+		t.Fatalf("blocked preflight = %#v", payload)
+	}
+	for _, forbidden := range []string{"private-http-blocked-evidence", "citation-http-blocked", "content_hash", research.dbPath} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("blocked response leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+}
+
+func TestKBaseHTTPResearchPreflightValidationMethodsAndDependencyUnavailable(t *testing.T) {
+	root := t.TempDir()
+	research, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = research.Close() })
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(NewBookKnowledgeStore(root), research, nil))
+	for _, test := range []struct {
+		name, method, body, wantError string
+		want                          int
+	}{
+		{name: "unknown field", method: http.MethodPost, body: `{"mode":"quick","question":"one","private":"secret"}`, want: http.StatusBadRequest, wantError: "invalid JSON body"},
+		{name: "oversized", method: http.MethodPost, body: `{"mode":"quick","question":"` + strings.Repeat("x", int(defaultResearchRunHTTPMaxBodyBytes)+1024) + `"}`, want: http.StatusRequestEntityTooLarge, wantError: "request body too large"},
+		{name: "bad mode", method: http.MethodPost, body: `{"mode":"private-mode","question":"one"}`, want: http.StatusBadRequest, wantError: "invalid_research_preflight_request"},
+		{name: "bad source", method: http.MethodPost, body: `{"mode":"quick","question":"one","requested_sources":["private-source"]}`, want: http.StatusBadRequest, wantError: "invalid_research_preflight_request"},
+		{name: "method", method: http.MethodGet, want: http.StatusMethodNotAllowed, wantError: "method_not_allowed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := requestJSONKBase(handler, test.method, "/api/research/preflight", "admin-secret", test.body)
+			if response.Code != test.want || response.Body.String() != fmt.Sprintf("{\"error\":%q}\n", test.wantError) {
+				t.Fatalf("status=%d body=%s want=%d/%q", response.Code, response.Body.String(), test.want, test.wantError)
+			}
+			for _, private := range []string{"secret", "private-mode", "private-source", research.dbPath} {
+				if strings.Contains(response.Body.String(), private) {
+					t.Fatalf("error leaked %q: %s", private, response.Body.String())
+				}
+			}
+		})
+	}
+
+	unavailableStore, err := OpenResearchStore(t.TempDir(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableHandler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(
+		NewBookKnowledgeStore(t.TempDir()), unavailableStore, nil,
+	))
+	databasePath := unavailableStore.dbPath
+	if err := unavailableStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unavailable := requestJSONKBase(unavailableHandler, http.MethodPost, "/api/research/preflight", "admin-secret",
+		`{"mode":"quick","question":"dependency cause must stay private","requested_sources":["knowledge"]}`)
+	if unavailable.Code != http.StatusServiceUnavailable || unavailable.Body.String() != "{\"error\":\"research_preflight_unavailable\"}\n" {
+		t.Fatalf("unavailable status=%d body=%s", unavailable.Code, unavailable.Body.String())
+	}
+	for _, private := range []string{"dependency cause", "database is closed", databasePath} {
+		if private != "" && strings.Contains(unavailable.Body.String(), private) {
+			t.Fatalf("unavailable response leaked %q: %s", private, unavailable.Body.String())
+		}
+	}
+}
+
+func TestKBaseHTTPResearchPreflightTypedErrorsAreStable(t *testing.T) {
+	handler := &kbaseHTTPHandler{}
+	for _, test := range []struct {
+		name      string
+		err       error
+		want      int
+		wantError string
+	}{
+		{name: "not found", err: ErrResearchPreflightNotFound, want: http.StatusNotFound, wantError: "research_preflight_not_found"},
+		{name: "foreign owner", err: ErrResearchPreflightOwner, want: http.StatusNotFound, wantError: "research_preflight_not_found"},
+		{name: "expired", err: ErrResearchPreflightExpired, want: http.StatusGone, wantError: "research_preflight_expired"},
+		{name: "conflict", err: ErrResearchPreflightIdempotencyConflict, want: http.StatusConflict, wantError: "research_preflight_conflict"},
+		{name: "unavailable", err: ErrResearchPreflightUnavailable, want: http.StatusServiceUnavailable, wantError: "research_preflight_unavailable"},
+		{name: "corrupt", err: ErrResearchPreflightCorrupt, want: http.StatusServiceUnavailable, wantError: "research_preflight_unavailable"},
+		{name: "unknown", err: errors.New("unknown private failure"), want: http.StatusServiceUnavailable, wantError: "research_preflight_unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.writeResearchPreflightHTTPError(response, fmt.Errorf("private-cause: %w", test.err))
+			if response.Code != test.want || response.Body.String() != fmt.Sprintf("{\"error\":%q}\n", test.wantError) {
+				t.Fatalf("status=%d body=%s want=%d/%q", response.Code, response.Body.String(), test.want, test.wantError)
+			}
+			if strings.Contains(response.Body.String(), "private-cause") || strings.Contains(response.Body.String(), test.err.Error()) {
+				t.Fatalf("typed error leaked cause: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func researchPreflightHTTPTestConfig(
+	knowledge *BookKnowledgeStore,
+	research *ResearchStore,
+	sourceSync *SourceSyncStore,
+) KBaseHTTPConfig {
+	return KBaseHTTPConfig{
+		Store: knowledge, AuthToken: "admin-secret", ResearchStore: research, SourceSync: sourceSync,
+		ResearchQuickBudget: ResearchBudget{
+			MaxIterations: 4, MaxEvidenceItems: 50, MaxQuotedChars: 4000,
+			MaxModelCalls: 2, MaxCostUSD: 0.5,
+		},
+		ResearchDeepBudget: ResearchBudget{
+			MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 16000,
+			MaxModelCalls: 8, MaxCostUSD: 2,
+		},
+	}
+}
+
+func researchPreflightServiceCheckPublic(checks []PublicResearchPreflightCheck, code string) PublicResearchPreflightCheck {
+	for _, check := range checks {
+		if check.Code == code {
+			return check
+		}
+	}
+	return PublicResearchPreflightCheck{}
 }
 
 func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {

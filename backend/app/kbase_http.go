@@ -128,6 +128,7 @@ type kbaseHTTPHandler struct {
 	researchStore           *ResearchStore
 	researchQuickBudget     ResearchBudget
 	researchDeepBudget      ResearchBudget
+	researchPreflight       *ResearchPreflightService
 	researchHTTPInitErr     error
 	sourceArtifacts         *SourceAgentArtifactCatalog
 	sourceAssets            *SourceAssetStore
@@ -259,8 +260,14 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		researchDeepBudget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 300, MaxQuotedChars: 80000, MaxModelCalls: 24, MaxCostUSD: 10}
 	}
 	var researchHTTPInitErr error
+	var researchPreflight *ResearchPreflightService
 	if cfg.ResearchStore != nil {
 		researchHTTPInitErr = migrateResearchHTTP(cfg.ResearchStore.db)
+		researchPreflight = &ResearchPreflightService{
+			Knowledge: store, Research: cfg.ResearchStore, SourceSync: cfg.SourceSync,
+			QuickBudget: researchQuickBudget, DeepBudget: researchDeepBudget,
+			Now: cfg.ResearchStore.now,
+		}
 	}
 	return &kbaseHTTPHandler{
 		store:                   store,
@@ -282,6 +289,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		researchStore:           cfg.ResearchStore,
 		researchQuickBudget:     researchQuickBudget,
 		researchDeepBudget:      researchDeepBudget,
+		researchPreflight:       researchPreflight,
 		researchHTTPInitErr:     researchHTTPInitErr,
 		sourceArtifacts:         cfg.SourceArtifacts,
 		sourceAssets:            assets,
@@ -420,6 +428,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	r = requestWithKBaseAuth(r, auth)
+	if r.URL.Path == "/api/research/preflight" {
+		h.handleResearchPreflight(w, r)
+		return
+	}
 	if r.URL.Path == "/api/research/runs" || strings.HasPrefix(r.URL.Path, "/api/research/runs/") {
 		h.handleResearchRuns(w, r)
 		return
@@ -4663,6 +4675,52 @@ func migrateResearchHTTP(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func (h *kbaseHTTPHandler) handleResearchPreflight(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if h.researchPreflight == nil || h.researchHTTPInitErr != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_preflight_unavailable")
+		return
+	}
+	auth, ok := kbaseRequestAuthFromContext(r.Context())
+	if !ok {
+		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var request ResearchPreflightRequest
+	if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchRunHTTPMaxBodyBytes, &request) {
+		return
+	}
+	normalized, err := NormalizeResearchPreflightRequest(request)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_research_preflight_request")
+		return
+	}
+	preflight, err := h.researchPreflight.Evaluate(
+		r.Context(), researchHTTPOwnerHash(auth), normalized,
+	)
+	if err != nil {
+		h.writeResearchPreflightHTTPError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusCreated, PublicResearchPreflight(*preflight))
+}
+
+func (h *kbaseHTTPHandler) writeResearchPreflightHTTPError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrResearchPreflightNotFound), errors.Is(err, ErrResearchPreflightOwner):
+		writeHTTPError(w, http.StatusNotFound, "research_preflight_not_found")
+	case errors.Is(err, ErrResearchPreflightExpired):
+		writeHTTPError(w, http.StatusGone, "research_preflight_expired")
+	case errors.Is(err, ErrResearchPreflightIdempotencyConflict):
+		writeHTTPError(w, http.StatusConflict, "research_preflight_conflict")
+	default:
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_preflight_unavailable")
+	}
 }
 
 func (h *kbaseHTTPHandler) handleResearchRuns(w http.ResponseWriter, r *http.Request) {
