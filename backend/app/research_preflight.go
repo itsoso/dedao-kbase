@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -21,6 +22,7 @@ const (
 	ResearchPreflightCheckBlocked = "blocked"
 
 	researchPreflightCandidateMax = 3
+	researchPreflightCoverageMax  = 256
 )
 
 const (
@@ -29,6 +31,8 @@ const (
 	researchPreflightReasonFreshRelease      = "fresh_release"
 	researchPreflightReasonTrustedEvaluation = "trusted_evaluation"
 	researchPreflightReasonWorkerReady       = "worker_ready"
+
+	ResearchPreflightWorkerNotRequired = "not_required"
 )
 
 type ResearchPreflightRequest struct {
@@ -52,22 +56,37 @@ type ResearchPreflight struct {
 }
 
 type ResearchPreflightCandidate struct {
-	PackageID        string   `json:"package_id"`
-	PackageVersion   string   `json:"package_version"`
-	ContentHash      string   `json:"content_hash"`
-	DisplayName      string   `json:"display_name,omitempty"`
-	MatchLevel       string   `json:"match_level"`
-	ReasonCodes      []string `json:"reason_codes,omitempty"`
-	KnowledgeScope   []string `json:"knowledge_scope,omitempty"`
-	UpdatedAt        string   `json:"updated_at,omitempty"`
-	EvaluationStatus string   `json:"evaluation_status,omitempty"`
-	SupportedSources []string `json:"supported_sources,omitempty"`
-	Readiness        string   `json:"readiness"`
+	PackageID        string                    `json:"package_id"`
+	PackageVersion   string                    `json:"package_version"`
+	ContentHash      string                    `json:"content_hash"`
+	DisplayName      string                    `json:"display_name,omitempty"`
+	MatchLevel       string                    `json:"match_level"`
+	ReasonCodes      []string                  `json:"reason_codes,omitempty"`
+	KnowledgeScope   []string                  `json:"knowledge_scope,omitempty"`
+	UpdatedAt        string                    `json:"updated_at,omitempty"`
+	EvaluationStatus string                    `json:"evaluation_status,omitempty"`
+	SupportedSources []string                  `json:"supported_sources,omitempty"`
+	Readiness        string                    `json:"readiness"`
+	Coverage         ResearchPreflightCoverage `json:"coverage"`
+	Budget           ResearchPreflightBudget   `json:"budget"`
+}
+
+type ResearchPreflightCoverage struct {
+	EvidenceCount int      `json:"evidence_count"`
+	ReleaseCount  int      `json:"release_count"`
+	CitationCount int      `json:"citation_count"`
+	ReleaseIDs    []string `json:"release_ids,omitempty"`
+}
+
+type ResearchPreflightBudget struct {
+	ResolvedMode string         `json:"resolved_mode"`
+	Limits       ResearchBudget `json:"limits"`
 }
 
 type ResearchPreflightCheck struct {
 	Code       string `json:"code"`
 	Status     string `json:"status"`
+	ResultCode string `json:"result_code,omitempty"`
 	Message    string `json:"message,omitempty"`
 	NextAction string `json:"next_action,omitempty"`
 }
@@ -122,21 +141,24 @@ type PublicResearchPreflightResult struct {
 }
 
 type PublicResearchPreflightCandidate struct {
-	PackageID        string   `json:"package_id"`
-	PackageVersion   string   `json:"package_version"`
-	DisplayName      string   `json:"display_name,omitempty"`
-	MatchLevel       string   `json:"match_level"`
-	ReasonCodes      []string `json:"reason_codes,omitempty"`
-	KnowledgeScope   []string `json:"knowledge_scope,omitempty"`
-	UpdatedAt        string   `json:"updated_at,omitempty"`
-	EvaluationStatus string   `json:"evaluation_status,omitempty"`
-	SupportedSources []string `json:"supported_sources,omitempty"`
-	Readiness        string   `json:"readiness"`
+	PackageID        string                    `json:"package_id"`
+	PackageVersion   string                    `json:"package_version"`
+	DisplayName      string                    `json:"display_name,omitempty"`
+	MatchLevel       string                    `json:"match_level"`
+	ReasonCodes      []string                  `json:"reason_codes,omitempty"`
+	KnowledgeScope   []string                  `json:"knowledge_scope,omitempty"`
+	UpdatedAt        string                    `json:"updated_at,omitempty"`
+	EvaluationStatus string                    `json:"evaluation_status,omitempty"`
+	SupportedSources []string                  `json:"supported_sources,omitempty"`
+	Readiness        string                    `json:"readiness"`
+	Coverage         ResearchPreflightCoverage `json:"coverage"`
+	Budget           ResearchPreflightBudget   `json:"budget"`
 }
 
 type PublicResearchPreflightCheck struct {
 	Code       string `json:"code"`
 	Status     string `json:"status"`
+	ResultCode string `json:"result_code,omitempty"`
 	Message    string `json:"message,omitempty"`
 	NextAction string `json:"next_action,omitempty"`
 }
@@ -228,6 +250,12 @@ func ValidateResearchPreflight(preflight ResearchPreflight) error {
 		if !isResearchPreflightCheckStatus(candidate.Readiness) {
 			return fmt.Errorf("candidate %d has unsupported check status %q", index, candidate.Readiness)
 		}
+		if err := validateResearchPreflightCoverage(candidate.Coverage); err != nil {
+			return fmt.Errorf("candidate %d coverage: %w", index, err)
+		}
+		if err := validateResearchPreflightBudget(candidate.Budget); err != nil {
+			return fmt.Errorf("candidate %d budget: %w", index, err)
+		}
 		switch candidate.Readiness {
 		case ResearchPreflightCheckPass, ResearchPreflightCheckWarning:
 			confirmableCandidate = true
@@ -246,6 +274,9 @@ func ValidateResearchPreflight(preflight ResearchPreflight) error {
 	for index, check := range preflight.Checks {
 		if !isResearchPreflightCheckStatus(check.Status) {
 			return fmt.Errorf("check %d has unsupported check status %q", index, check.Status)
+		}
+		if !isResearchPreflightSafeCode(check.ResultCode) {
+			return fmt.Errorf("check %d has invalid result_code", index)
 		}
 		if preflight.Status == ResearchPreflightStatusReady && check.Status == ResearchPreflightCheckBlocked {
 			return fmt.Errorf("ready preflight cannot contain blocked check %d", index)
@@ -277,12 +308,20 @@ func PublicResearchPreflight(preflight ResearchPreflight) PublicResearchPrefligh
 			EvaluationStatus: candidate.EvaluationStatus,
 			SupportedSources: append([]string(nil), candidate.SupportedSources...),
 			Readiness:        candidate.Readiness,
+			Coverage: ResearchPreflightCoverage{
+				EvidenceCount: candidate.Coverage.EvidenceCount,
+				ReleaseCount:  candidate.Coverage.ReleaseCount,
+				CitationCount: candidate.Coverage.CitationCount,
+				ReleaseIDs:    append([]string(nil), candidate.Coverage.ReleaseIDs...),
+			},
+			Budget: candidate.Budget,
 		})
 	}
 	for _, check := range preflight.Checks {
 		public.Checks = append(public.Checks, PublicResearchPreflightCheck{
 			Code:       check.Code,
 			Status:     check.Status,
+			ResultCode: check.ResultCode,
 			Message:    check.Message,
 			NextAction: check.NextAction,
 		})
@@ -667,4 +706,57 @@ func isResearchPreflightCheckStatus(value string) bool {
 	default:
 		return false
 	}
+}
+
+func validateResearchPreflightCoverage(coverage ResearchPreflightCoverage) error {
+	if coverage.EvidenceCount < 0 || coverage.EvidenceCount > researchPreflightCoverageMax ||
+		coverage.ReleaseCount < 0 || coverage.ReleaseCount > researchPreflightCoverageMax ||
+		coverage.CitationCount < 0 || coverage.CitationCount > researchPreflightCoverageMax {
+		return fmt.Errorf("counts must be between 0 and %d", researchPreflightCoverageMax)
+	}
+	if len(coverage.ReleaseIDs) > researchPreflightCoverageMax || coverage.ReleaseCount != len(coverage.ReleaseIDs) {
+		return fmt.Errorf("release_count must match bounded release_ids")
+	}
+	seen := make(map[string]bool, len(coverage.ReleaseIDs))
+	for _, releaseID := range coverage.ReleaseIDs {
+		if strings.TrimSpace(releaseID) == "" || len([]rune(releaseID)) > researchPackageIDMaxRunes || seen[releaseID] {
+			return fmt.Errorf("release_ids must be non-empty, bounded, and unique")
+		}
+		seen[releaseID] = true
+	}
+	return nil
+}
+
+func validateResearchPreflightBudget(budget ResearchPreflightBudget) error {
+	if budget.ResolvedMode == "" && budget.Limits == (ResearchBudget{}) {
+		return nil
+	}
+	if budget.ResolvedMode != ResearchModeQuick && budget.ResolvedMode != ResearchModeDeep {
+		return fmt.Errorf("resolved_mode must be quick or deep")
+	}
+	if budget.Limits.MaxIterations < 0 || budget.Limits.MaxIterations > researchBudgetMaxIterations ||
+		budget.Limits.MaxEvidenceItems < 0 || budget.Limits.MaxEvidenceItems > researchBudgetMaxEvidence ||
+		budget.Limits.MaxQuotedChars < 0 || budget.Limits.MaxQuotedChars > researchBudgetMaxQuotedChars ||
+		budget.Limits.MaxModelCalls < 0 || budget.Limits.MaxModelCalls > researchBudgetMaxModelCalls ||
+		budget.Limits.MaxCostUSD < 0 || budget.Limits.MaxCostUSD > researchBudgetMaxCostUSD ||
+		math.IsNaN(budget.Limits.MaxCostUSD) || math.IsInf(budget.Limits.MaxCostUSD, 0) {
+		return fmt.Errorf("limits are outside supported bounds")
+	}
+	return nil
+}
+
+func isResearchPreflightSafeCode(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
