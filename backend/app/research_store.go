@@ -235,6 +235,7 @@ func migrateResearchStore(db *sql.DB) error {
 			expires_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_research_preflights_owner_expiry ON research_preflights(owner_hash, expires_at, preflight_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_preflights_expiry ON research_preflights(expires_at, preflight_id)`,
 		`CREATE TABLE IF NOT EXISTS research_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`INSERT OR IGNORE INTO research_meta(key, value) VALUES ('schema_version', '1')`,
 	}

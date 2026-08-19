@@ -1,12 +1,16 @@
 package app
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 var (
@@ -100,6 +104,86 @@ func TestResearchPreflightStoreMigrationContainsNoRawQuestionColumns(t *testing.
 		if columns[forbidden] {
 			t.Fatalf("migration contains private column %q", forbidden)
 		}
+	}
+}
+
+func TestResearchPreflightStoreCleanupUsesExpiryCoveringIndex(t *testing.T) {
+	store, err := OpenResearchStore(t.TempDir(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var indexCount int
+	if err := store.db.QueryRow(`SELECT COUNT(1) FROM sqlite_master WHERE type = 'index' AND name = ?`,
+		"idx_research_preflights_expiry").Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("expiry index count = %d, want 1", indexCount)
+	}
+
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN
+		SELECT preflight_id FROM research_preflights
+		WHERE expires_at <= ? ORDER BY expires_at, preflight_id LIMIT ?`,
+		formatResearchPreflightTimestamp(time.Now()), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(details, " | ")
+	if !strings.Contains(plan, "USING COVERING INDEX idx_research_preflights_expiry") ||
+		strings.Contains(plan, "USE TEMP B-TREE") || strings.Contains(plan, "SCAN research_preflights") {
+		t.Fatalf("cleanup query plan = %q", plan)
+	}
+}
+
+func TestResearchPreflightStoreMigrationRecreatesExpiryIndexWithoutDataLoss(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO research_meta(key, value) VALUES ('migration-probe', 'preserved')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DROP INDEX IF EXISTS idx_research_preflights_expiry`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var value string
+	if err := reopened.db.QueryRow(`SELECT value FROM research_meta WHERE key = 'migration-probe'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "preserved" {
+		t.Fatalf("migration probe = %q", value)
+	}
+	var indexCount int
+	if err := reopened.db.QueryRow(`SELECT COUNT(1) FROM sqlite_master WHERE type = 'index' AND name = ?`,
+		"idx_research_preflights_expiry").Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("recreated expiry index count = %d, want 1", indexCount)
 	}
 }
 
@@ -255,7 +339,7 @@ func TestResearchPreflightStoreRejectsPersistedNonContractTTL(t *testing.T) {
 				formatResearchPreflightTimestamp(now.Add(test.ttl)), created.PreflightID); err != nil {
 				t.Fatal(err)
 			}
-			if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, testResearchPreflightOwnerA); loaded != nil || err == nil || !strings.Contains(err.Error(), "timestamps") {
+			if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, testResearchPreflightOwnerA); loaded != nil || !errors.Is(err, ErrResearchPreflightCorrupt) {
 				t.Fatalf("tampered ttl load = %#v, %v", loaded, err)
 			}
 		})
@@ -284,7 +368,7 @@ func TestResearchPreflightStoreJSONIsBoundedAndCorruptionFailsClosed(t *testing.
 	if _, err := store.db.Exec(`UPDATE research_preflights SET candidates_json = ? WHERE preflight_id = ?`, `[{"unknown":true}]`, created.PreflightID); err != nil {
 		t.Fatal(err)
 	}
-	if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, testResearchPreflightOwnerA); loaded != nil || err == nil || !strings.Contains(err.Error(), "persisted research preflight") {
+	if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, testResearchPreflightOwnerA); loaded != nil || !errors.Is(err, ErrResearchPreflightCorrupt) {
 		t.Fatalf("corrupt load = %#v, %v", loaded, err)
 	}
 }
@@ -411,8 +495,99 @@ func TestResearchPreflightStoreRequiresCanonicalOwnerHash(t *testing.T) {
 	if _, err := store.db.Exec(`UPDATE research_preflights SET owner_hash = ? WHERE preflight_id = ?`, strings.Repeat("A", 64), created.PreflightID); err != nil {
 		t.Fatal(err)
 	}
-	if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, ownerHash); loaded != nil || err == nil || errors.Is(err, ErrResearchPreflightOwner) || !strings.Contains(err.Error(), "persisted research preflight") {
+	if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, ownerHash); loaded != nil || !errors.Is(err, ErrResearchPreflightCorrupt) || errors.Is(err, ErrResearchPreflightOwner) {
 		t.Fatalf("tampered owner load = %#v, %v", loaded, err)
+	}
+}
+
+func TestResearchPreflightStoreClassifiesLockedDatabaseAsUnavailable(t *testing.T) {
+	store, err := OpenResearchStore(t.TempDir(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(`PRAGMA busy_timeout = 20`); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := sql.Open("sqlite3", store.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	connection, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(context.Background(), `PRAGMA busy_timeout = 20`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = connection.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+
+	result := testResearchPreflight()
+	result.PreflightID = "research-preflight-locked"
+	created, saveErr := store.SaveResearchPreflight(testResearchPreflightOwnerA, testResearchPreflightStoreRequest(), result, 10*time.Minute)
+	if created != nil || !errors.Is(saveErr, ErrResearchPreflightUnavailable) {
+		t.Fatalf("locked save = %#v, %v", created, saveErr)
+	}
+	var sqliteErr sqlite3.Error
+	if !errors.As(saveErr, &sqliteErr) || (sqliteErr.Code != sqlite3.ErrBusy && sqliteErr.Code != sqlite3.ErrLocked) {
+		t.Fatalf("locked save SQLite cause = %#v, %v", sqliteErr, saveErr)
+	}
+	if _, err := connection.ExecContext(context.Background(), `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	if created, err := store.SaveResearchPreflight(testResearchPreflightOwnerA, testResearchPreflightStoreRequest(), result, 10*time.Minute); err != nil || created == nil {
+		t.Fatalf("retry after unlock = %#v, %v", created, err)
+	}
+}
+
+func TestResearchPreflightStoreRequestHashIsStableAndCanonical(t *testing.T) {
+	requestHash, err := hashResearchPreflightRequest(testResearchPreflightStoreRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expected = "sha256:ac59b2ab14219c87c2f7dc6f1545d04423862362e9e379ceeec33ee14f402687"
+	if requestHash != expected {
+		t.Fatalf("request hash = %q, want %q", requestHash, expected)
+	}
+	normalized := testResearchPreflightStoreRequest()
+	normalized.Question = "  generic question  "
+	normalized.RequestedSources = []string{ResearchSourceChatlog, ResearchSourceKnowledge}
+	normalizedHash, err := hashResearchPreflightRequest(normalized)
+	if err != nil || normalizedHash != expected {
+		t.Fatalf("normalized request hash = %q, %v", normalizedHash, err)
+	}
+}
+
+func TestResearchPreflightStoreRejectsNonCanonicalPersistedRequestHash(t *testing.T) {
+	store, err := OpenResearchStore(t.TempDir(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result := testResearchPreflight()
+	result.PreflightID = "research-preflight-uppercase-hash"
+	created, err := store.SaveResearchPreflight(testResearchPreflightOwnerA, testResearchPreflightStoreRequest(), result, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uppercase := "sha256:" + strings.Repeat("A", 64)
+	if _, err := store.db.Exec(`UPDATE research_preflights SET request_hash = ? WHERE preflight_id = ?`, uppercase, created.PreflightID); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := store.LoadResearchPreflightForOwner(created.PreflightID, testResearchPreflightOwnerA); loaded != nil || !errors.Is(err, ErrResearchPreflightCorrupt) {
+		t.Fatalf("uppercase request hash load = %#v, %v", loaded, err)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -28,6 +30,8 @@ var (
 	ErrResearchPreflightExpired             = errors.New("research preflight expired")
 	ErrResearchPreflightOwner               = errors.New("research preflight belongs to another owner")
 	ErrResearchPreflightIdempotencyConflict = errors.New("research preflight idempotency conflict")
+	ErrResearchPreflightUnavailable         = errors.New("research preflight store unavailable")
+	ErrResearchPreflightCorrupt             = errors.New("research preflight persisted data is corrupt")
 )
 
 type researchPreflightRecord struct {
@@ -81,7 +85,7 @@ func (s *ResearchStore) SaveResearchPreflight(
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, err
+		return nil, classifyResearchPreflightStoreError("begin preflight save", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	inserted, err := tx.Exec(`INSERT INTO research_preflights (
@@ -93,15 +97,15 @@ func (s *ResearchStore) SaveResearchPreflight(
 		incoming.candidatesJSON, incoming.checksJSON, incoming.gapsJSON,
 		result.ParentRunID, result.CreatedAt, result.ExpiresAt)
 	if err != nil {
-		return nil, err
+		return nil, classifyResearchPreflightStoreError("insert preflight", err)
 	}
 	insertedCount, err := inserted.RowsAffected()
 	if err != nil {
-		return nil, err
+		return nil, classifyResearchPreflightStoreError("read preflight insert result", err)
 	}
 	if insertedCount == 1 {
 		if err := tx.Commit(); err != nil {
-			return nil, err
+			return nil, classifyResearchPreflightStoreError("commit preflight insert", err)
 		}
 		return &result, nil
 	}
@@ -111,10 +115,10 @@ func (s *ResearchStore) SaveResearchPreflight(
 
 	record, err := queryResearchPreflightRecord(tx, result.PreflightID)
 	if err != nil {
-		return nil, err
+		return nil, classifyResearchPreflightStoreError("load preflight replay", err)
 	}
 	if err := validateResearchPreflightOwnerHash(record.ownerHash); err != nil {
-		return nil, fmt.Errorf("persisted research preflight owner is invalid")
+		return nil, corruptResearchPreflightError("validate persisted owner", err)
 	}
 	if record.ownerHash != ownerHash {
 		return nil, ErrResearchPreflightOwner
@@ -135,7 +139,7 @@ func (s *ResearchStore) SaveResearchPreflight(
 		return nil, ErrResearchPreflightIdempotencyConflict
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, classifyResearchPreflightStoreError("commit preflight replay", err)
 	}
 	return existing, nil
 }
@@ -153,10 +157,10 @@ func (s *ResearchStore) LoadResearchPreflightForOwner(preflightID, ownerHash str
 		return nil, ErrResearchPreflightNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, classifyResearchPreflightStoreError("load preflight", err)
 	}
 	if err := validateResearchPreflightOwnerHash(record.ownerHash); err != nil {
-		return nil, fmt.Errorf("persisted research preflight owner is invalid")
+		return nil, corruptResearchPreflightError("validate persisted owner", err)
 	}
 	if record.ownerHash != ownerHash {
 		return nil, ErrResearchPreflightOwner
@@ -182,10 +186,13 @@ func (s *ResearchStore) DeleteExpiredResearchPreflights(limit int) (int, error) 
 		ORDER BY expires_at, preflight_id LIMIT ?
 	)`, now, limit)
 	if err != nil {
-		return 0, err
+		return 0, classifyResearchPreflightStoreError("delete expired preflights", err)
 	}
 	deleted, err := result.RowsAffected()
-	return int(deleted), err
+	if err != nil {
+		return 0, classifyResearchPreflightStoreError("read expired preflight delete result", err)
+	}
+	return int(deleted), nil
 }
 
 type researchPreflightPayload struct {
@@ -225,13 +232,13 @@ func queryResearchPreflightRecord(queryer researchRowQuerier, preflightID string
 
 func decodeResearchPreflightRecord(record researchPreflightRecord) (*ResearchPreflight, error) {
 	if err := validateResearchPreflightID(record.preflightID); err != nil {
-		return nil, fmt.Errorf("persisted research preflight is invalid: %w", err)
+		return nil, corruptResearchPreflightError("validate persisted preflight id", err)
 	}
 	if err := validateResearchPreflightOwnerHash(record.ownerHash); err != nil {
-		return nil, fmt.Errorf("persisted research preflight is invalid: %w", err)
+		return nil, corruptResearchPreflightError("validate persisted owner", err)
 	}
 	if !validResearchPreflightRequestHash(record.requestHash) {
-		return nil, fmt.Errorf("persisted research preflight request hash is invalid")
+		return nil, corruptResearchPreflightError("validate persisted request hash", nil)
 	}
 	createdAt, createdErr := time.Parse(time.RFC3339Nano, record.createdAt)
 	expiresAt, expiresErr := time.Parse(time.RFC3339Nano, record.expiresAt)
@@ -239,7 +246,7 @@ func decodeResearchPreflightRecord(record researchPreflightRecord) (*ResearchPre
 		record.createdAt != formatResearchPreflightTimestamp(createdAt) ||
 		record.expiresAt != formatResearchPreflightTimestamp(expiresAt) ||
 		expiresAt.Sub(createdAt) != researchPreflightStoreTTL {
-		return nil, fmt.Errorf("persisted research preflight timestamps are invalid")
+		return nil, corruptResearchPreflightError("validate persisted timestamps", nil)
 	}
 	preflight := &ResearchPreflight{
 		PreflightID: record.preflightID,
@@ -259,7 +266,7 @@ func decodeResearchPreflightRecord(record researchPreflightRecord) (*ResearchPre
 		return nil, err
 	}
 	if err := ValidateResearchPreflight(*preflight); err != nil {
-		return nil, fmt.Errorf("persisted research preflight is invalid: %w", err)
+		return nil, corruptResearchPreflightError("validate persisted payload", err)
 	}
 	return preflight, nil
 }
@@ -277,19 +284,19 @@ func marshalBoundedResearchPreflightJSON(value any) ([]byte, error) {
 
 func decodeBoundedResearchPreflightJSON(raw string, target any) error {
 	if len(raw) == 0 || len(raw) > researchPreflightJSONMaxBytes {
-		return fmt.Errorf("persisted research preflight structured data exceeds bounds")
+		return corruptResearchPreflightError("decode persisted structured data", nil)
 	}
 	decoder := json.NewDecoder(bytes.NewReader([]byte(raw)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("persisted research preflight structured data is invalid: %w", err)
+		return corruptResearchPreflightError("decode persisted structured data", err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("persisted research preflight structured data is invalid")
+		return corruptResearchPreflightError("decode persisted structured data", err)
 	}
 	canonical, err := marshalBoundedResearchPreflightJSON(target)
 	if err != nil || string(canonical) != raw {
-		return fmt.Errorf("persisted research preflight structured data is not canonical")
+		return corruptResearchPreflightError("validate canonical persisted structured data", err)
 	}
 	return nil
 }
@@ -335,8 +342,42 @@ func validateResearchPreflightOwnerHash(value string) error {
 }
 
 func validResearchPreflightRequestHash(value string) bool {
-	raw, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
-	return strings.HasPrefix(value, "sha256:") && err == nil && len(raw) == sha256.Size
+	if len(value) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	digest := strings.TrimPrefix(value, "sha256:")
+	raw, err := hex.DecodeString(digest)
+	return digest == strings.ToLower(digest) && err == nil && len(raw) == sha256.Size
+}
+
+func classifyResearchPreflightStoreError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, sentinel := range []error{
+		ErrResearchPreflightNotFound,
+		ErrResearchPreflightExpired,
+		ErrResearchPreflightOwner,
+		ErrResearchPreflightIdempotencyConflict,
+		ErrResearchPreflightUnavailable,
+		ErrResearchPreflightCorrupt,
+	} {
+		if errors.Is(err, sentinel) {
+			return fmt.Errorf("%s: %w", operation, err)
+		}
+	}
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && (sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked) {
+		return fmt.Errorf("%w: %s: %w", ErrResearchPreflightUnavailable, operation, err)
+	}
+	return fmt.Errorf("%w: %s: %w", ErrResearchPreflightUnavailable, operation, err)
+}
+
+func corruptResearchPreflightError(operation string, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("%w: %s", ErrResearchPreflightCorrupt, operation)
+	}
+	return fmt.Errorf("%w: %s: %w", ErrResearchPreflightCorrupt, operation, cause)
 }
 
 func researchPreflightExpired(value string, now time.Time) bool {
