@@ -4831,6 +4831,7 @@ func (h *kbaseHTTPHandler) handleResearchRunCreate(w http.ResponseWriter, r *htt
 	}
 	normalized, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
 		Mode: request.Mode, Question: request.Question, RequestedSources: request.RequestedSources,
+		SubjectIDs: request.SubjectIDs,
 	})
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_research_request")
@@ -4839,6 +4840,7 @@ func (h *kbaseHTTPHandler) handleResearchRunCreate(w http.ResponseWriter, r *htt
 	request.Mode = normalized.Mode
 	request.Question = normalized.Question
 	request.RequestedSources = normalized.RequestedSources
+	request.SubjectIDs = normalized.SubjectIDs
 	mode, reasons, err := RouteResearchMode(request)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_research_request")

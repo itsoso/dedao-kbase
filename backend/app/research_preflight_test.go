@@ -14,6 +14,7 @@ func TestValidateResearchPreflightRequestNormalizesBoundedScope(t *testing.T) {
 		Mode:              " auto ",
 		Question:          "  compare evidence  ",
 		RequestedSources:  []string{"knowledge", "chatlog"},
+		SubjectIDs:        []string{" subject-b ", "subject-a", "subject-a"},
 		PackageConstraint: "  collection-agent  ",
 		ParentRunID:       "research-run-parent_1",
 	})
@@ -25,6 +26,9 @@ func TestValidateResearchPreflightRequestNormalizesBoundedScope(t *testing.T) {
 	}
 	if request.PackageConstraint != "collection-agent" || request.ParentRunID != "research-run-parent_1" {
 		t.Fatalf("normalized optional scope = %#v", request)
+	}
+	if !reflect.DeepEqual(request.SubjectIDs, []string{"subject-a", "subject-b"}) {
+		t.Fatalf("normalized subject_ids = %#v", request.SubjectIDs)
 	}
 }
 
@@ -70,6 +74,22 @@ func TestValidateResearchPreflightRequestRejectsHardBounds(t *testing.T) {
 				RequestedSources: make([]string, researchRequestedSourcesMax+1),
 			},
 			want: "requested_sources exceeds",
+		},
+		{
+			name: "subjects bounded",
+			request: ResearchPreflightRequest{
+				Question:   "compare evidence",
+				SubjectIDs: make([]string, researchSubjectIDsMax+1),
+			},
+			want: "subject_ids exceeds",
+		},
+		{
+			name: "subject canonical",
+			request: ResearchPreflightRequest{
+				Question:   "compare evidence",
+				SubjectIDs: []string{"../private-subject"},
+			},
+			want: "subject_ids",
 		},
 		{
 			name: "duplicate source rejected",

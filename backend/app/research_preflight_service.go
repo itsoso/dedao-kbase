@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+var researchPreflightWorkerReadinessHook = func() error { return nil }
+
 const (
 	researchPreflightProbeMaxReleases  = 8
 	researchPreflightProbeMaxUnits     = 64
@@ -388,6 +390,9 @@ func (s *ResearchPreflightService) workerReadiness(
 	}
 	if s.SourceSync == nil {
 		return SourceAgentObservedOffline, SourceAgentObservedOffline, nil
+	}
+	if err := researchPreflightWorkerReadinessHook(); err != nil {
+		return "", "", fmt.Errorf("%w: Worker state unavailable: %w", ErrResearchPreflightUnavailable, err)
 	}
 	agent, err := s.SourceSync.GetSourceAgent("chatlog-agent")
 	if errors.Is(err, ErrSourceAgentNotFound) {

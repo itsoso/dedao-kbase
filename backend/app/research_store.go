@@ -240,6 +240,7 @@ func migrateResearchStore(db *sql.DB) error {
 			gaps_json TEXT NOT NULL,
 			mode TEXT NOT NULL DEFAULT '',
 			requested_sources_json TEXT NOT NULL DEFAULT '[]',
+			subject_ids_json TEXT NOT NULL DEFAULT '[]',
 			package_constraint TEXT NOT NULL DEFAULT '',
 			parent_run_id TEXT NOT NULL DEFAULT '',
 			bound_run_id TEXT NOT NULL DEFAULT '',
@@ -277,6 +278,9 @@ func migrateResearchStore(db *sql.DB) error {
 	if err := ensureResearchStoreColumn(db, "research_preflights", "requested_sources_json", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
 		return err
 	}
+	if err := ensureResearchStoreColumn(db, "research_preflights", "subject_ids_json", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		return err
+	}
 	if err := ensureResearchStoreColumn(db, "research_preflights", "package_constraint", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
@@ -292,9 +296,37 @@ func migrateResearchStore(db *sql.DB) error {
 	if err := ensureResearchStoreColumn(db, "research_model_invocations", "failure_code", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
-	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_research_runs_preflight_binding
-		ON research_runs(preflight_id) WHERE preflight_id <> ''`)
-	return err
+	bindingTx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = bindingTx.Rollback() }()
+	if err := detectResearchRunPreflightBindingConflict(bindingTx); err != nil {
+		return err
+	}
+	if _, err := bindingTx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_research_runs_preflight_binding
+		ON research_runs(preflight_id) WHERE preflight_id <> ''`); err != nil {
+		return err
+	}
+	return bindingTx.Commit()
+}
+
+func detectResearchRunPreflightBindingConflict(queryer researchRowQuerier) error {
+	var preflightID string
+	var count int
+	err := queryer.QueryRow(`SELECT preflight_id, COUNT(*) FROM research_runs
+		WHERE preflight_id <> '' GROUP BY preflight_id HAVING COUNT(*) > 1
+		ORDER BY preflight_id LIMIT 1`).Scan(&preflightID, &count)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len([]rune(preflightID)) > researchPreflightIDMaxRunes || !validResearchPreflightResourceID(preflightID) {
+		return fmt.Errorf("%w: duplicate non-canonical preflight binding count=%d", ErrResearchPreflightCorrupt, count)
+	}
+	return fmt.Errorf("%w: preflight_id %q is bound to %d research runs", ErrResearchPreflightCorrupt, preflightID, count)
 }
 
 func ensureResearchStoreColumn(db *sql.DB, table, column, definition string) error {
@@ -803,6 +835,17 @@ func loadResearchRun(queryer researchRowQuerier, runID string) (*ResearchRun, er
 	if err != nil {
 		return nil, err
 	}
+	for _, link := range []struct {
+		name, value string
+	}{
+		{name: "parent_run_id", value: run.ParentRunID},
+		{name: "preflight_id", value: run.PreflightID},
+	} {
+		if link.value != "" &&
+			(len([]rune(link.value)) > researchPreflightIDMaxRunes || !validResearchPreflightResourceID(link.value)) {
+			return nil, fmt.Errorf("%w: persisted research run %s is not canonical", ErrResearchPreflightCorrupt, link.name)
+		}
+	}
 	for _, field := range []struct {
 		data  string
 		value any
@@ -871,12 +914,51 @@ func validateResearchTransitionInput(transition ResearchTransition) error {
 }
 
 func hashResearchRunInput(input ResearchRunInput) (string, error) {
-	encoded, err := json.Marshal(input)
+	request, err := normalizeResearchRunConfirmationRequest(input.Request)
+	if err != nil {
+		return "", err
+	}
+	canonical := struct {
+		SchemaVersion    string   `json:"schema_version"`
+		PreflightID      string   `json:"preflight_id"`
+		Mode             string   `json:"mode"`
+		Question         string   `json:"question"`
+		PackageID        string   `json:"package_id"`
+		PackageVersion   string   `json:"package_version"`
+		RequestedSources []string `json:"requested_sources"`
+		SubjectIDs       []string `json:"subject_ids"`
+	}{
+		SchemaVersion: "research-run-confirmation/v1", PreflightID: request.PreflightID,
+		Mode: request.Mode, Question: request.Question, PackageID: request.PackageID,
+		PackageVersion: request.PackageVersion, RequestedSources: request.RequestedSources,
+		SubjectIDs: request.SubjectIDs,
+	}
+	encoded, err := json.Marshal(canonical)
 	if err != nil {
 		return "", err
 	}
 	digest := sha256.Sum256(encoded)
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func normalizeResearchRunConfirmationRequest(request ResearchRunRequest) (ResearchRunRequest, error) {
+	normalized, err := NormalizeResearchPreflightRequest(ResearchPreflightRequest{
+		Mode: request.Mode, Question: request.Question, RequestedSources: request.RequestedSources,
+		SubjectIDs: request.SubjectIDs,
+	})
+	if err != nil {
+		return ResearchRunRequest{}, err
+	}
+	request.Mode = normalized.Mode
+	request.Question = normalized.Question
+	request.RequestedSources = normalized.RequestedSources
+	request.SubjectIDs = normalized.SubjectIDs
+	request.PackageID = strings.TrimSpace(request.PackageID)
+	request.PackageVersion = strings.TrimSpace(request.PackageVersion)
+	if err := ValidateResearchRunRequest(request); err != nil {
+		return ResearchRunRequest{}, err
+	}
+	return request, nil
 }
 
 func newResearchRunID() string {

@@ -2566,9 +2566,12 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	}
 
 	preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret",
-		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"]}`)
+		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`)
 	if preflightResponse.Code != http.StatusCreated {
 		t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+	}
+	if strings.Contains(preflightResponse.Body.String(), "subject-private") || strings.Contains(preflightResponse.Body.String(), `"subject_ids"`) {
+		t.Fatalf("preflight response exposed subject metadata: %s", preflightResponse.Body.String())
 	}
 	var preflight PublicResearchPreflightResult
 	if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
@@ -3084,6 +3087,116 @@ func TestKBaseHTTPResearchRunPreflightReplaySurvivesLaterPackageDrift(t *testing
 	assertResearchRunCount(t, research, 1)
 }
 
+func TestKBaseHTTPResearchRunPreflightAuthorityRejectsBeforePackageIO(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	bearerOwner := researchHTTPOwnerHash(kbaseRequestAuth{Method: kbaseAuthMethodBearer})
+
+	t.Run("foreign owner", func(t *testing.T) {
+		knowledge := NewBookKnowledgeStore(t.TempDir())
+		pkg := publishResearchPreflightServicePackage(
+			t, knowledge, "authority-foreign-agent", "release-authority-foreign", "citation-authority-foreign",
+			"authority foreign evidence", now, nil,
+		)
+		research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+		source := openResearchPreflightSourceStore(t, now)
+		if _, err := source.HeartbeatAgent(healthyResearchPreflightHeartbeat()); err != nil {
+			t.Fatal(err)
+		}
+		preflight, err := testResearchPreflightService(knowledge, research, source, now).Evaluate(
+			context.Background(), testResearchPreflightOwnerB, ResearchPreflightRequest{
+				Mode: ResearchModeDeep, Question: "authority foreign evidence",
+				RequestedSources: []string{ResearchSourceChatlog},
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, source))
+		loads := 0
+		workerChecks := 0
+		previous := agentPackageArtifactLoadHook
+		agentPackageArtifactLoadHook = func(context.Context, string) error {
+			loads++
+			return nil
+		}
+		t.Cleanup(func() { agentPackageArtifactLoadHook = previous })
+		previousWorker := researchPreflightWorkerReadinessHook
+		researchPreflightWorkerReadinessHook = func() error {
+			workerChecks++
+			return os.ErrPermission
+		}
+		t.Cleanup(func() { researchPreflightWorkerReadinessHook = previousWorker })
+		body := fmt.Sprintf(`{"preflight_id":%q,"mode":"deep","question":"authority foreign evidence","package_id":%q,"package_version":%q,"requested_sources":["chatlog"]}`,
+			preflight.PreflightID, pkg.PackageID, pkg.Version)
+		request := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer admin-secret")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "authority-foreign-key")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound || response.Body.String() != "{\"error\":\"research_preflight_not_found\"}\n" || loads != 0 || workerChecks != 0 {
+			t.Fatalf("status=%d body=%s artifact_loads=%d worker_checks=%d bearer_owner=%s", response.Code, response.Body.String(), loads, workerChecks, bearerOwner)
+		}
+		assertResearchRunCount(t, research, 0)
+	})
+
+	t.Run("consumed with new key", func(t *testing.T) {
+		knowledge := NewBookKnowledgeStore(t.TempDir())
+		pkg := publishResearchPreflightServicePackage(
+			t, knowledge, "authority-consumed-agent", "release-authority-consumed", "citation-authority-consumed",
+			"authority consumed evidence", now, nil,
+		)
+		research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+		source := openResearchPreflightSourceStore(t, now)
+		if _, err := source.HeartbeatAgent(healthyResearchPreflightHeartbeat()); err != nil {
+			t.Fatal(err)
+		}
+		preflight, err := testResearchPreflightService(knowledge, research, source, now).Evaluate(
+			context.Background(), bearerOwner, ResearchPreflightRequest{
+				Mode: ResearchModeDeep, Question: "authority consumed evidence",
+				RequestedSources: []string{ResearchSourceChatlog},
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, source))
+		body := fmt.Sprintf(`{"preflight_id":%q,"mode":"deep","question":"authority consumed evidence","package_id":%q,"package_version":%q,"requested_sources":["chatlog"]}`,
+			preflight.PreflightID, pkg.PackageID, pkg.Version)
+		create := func(key string) *httptest.ResponseRecorder {
+			request := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer admin-secret")
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", key)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			return response
+		}
+		if created := create("authority-consumed-first"); created.Code != http.StatusCreated {
+			t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+		}
+		loads := 0
+		workerChecks := 0
+		previous := agentPackageArtifactLoadHook
+		agentPackageArtifactLoadHook = func(context.Context, string) error {
+			loads++
+			return nil
+		}
+		t.Cleanup(func() { agentPackageArtifactLoadHook = previous })
+		previousWorker := researchPreflightWorkerReadinessHook
+		researchPreflightWorkerReadinessHook = func() error {
+			workerChecks++
+			return os.ErrPermission
+		}
+		t.Cleanup(func() { researchPreflightWorkerReadinessHook = previousWorker })
+		consumed := create("authority-consumed-second")
+		if consumed.Code != http.StatusConflict || consumed.Body.String() != "{\"error\":\"research_preflight_conflict\"}\n" || loads != 0 || workerChecks != 0 {
+			t.Fatalf("consumed status=%d body=%s artifact_loads=%d worker_checks=%d", consumed.Code, consumed.Body.String(), loads, workerChecks)
+		}
+		assertResearchRunCount(t, research, 1)
+	})
+}
+
 func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
 	clock := &browserSessionTestClock{now: time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)}
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 903)
@@ -3196,6 +3309,34 @@ func TestKBaseHTTPResearchRunValidationAndMethods(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestKBaseHTTPResearchRunCorruptPersistedLinkStaysRedacted(t *testing.T) {
+	root := t.TempDir()
+	research := newResearchStoreForTest(t)
+	run := createResearchRunForTest(t, research, "http-corrupt-preflight-link")
+	privateLink := "../sensitive-preflight-link"
+	if _, err := research.db.Exec(`UPDATE research_runs SET preflight_id = ? WHERE run_id = ?`, privateLink, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	ownerHash := researchHTTPOwnerHash(kbaseRequestAuth{Method: kbaseAuthMethodBearer})
+	if _, err := research.db.Exec(`INSERT INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?)`,
+		run.RunID, ownerHash, run.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", ResearchStore: research,
+	})
+	request := httptest.NewRequest(http.MethodGet, "/api/research/runs/"+run.RunID, nil)
+	request.Header.Set("Authorization", "Bearer admin-secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"error\":\"research_service_unavailable\"}\n" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), privateLink) || strings.Contains(response.Body.String(), "sensitive") {
+		t.Fatalf("corrupt link leaked: %s", response.Body.String())
 	}
 }
 

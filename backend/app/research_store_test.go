@@ -82,6 +82,115 @@ func TestResearchStoreMigrationAddsModelInvocationFailureCode(t *testing.T) {
 	}
 }
 
+func TestResearchRunConfirmationHashUsesCanonicalClientSemanticsOnly(t *testing.T) {
+	base := researchStoreTestInput("canonical-confirmation")
+	base.Request.Mode = ResearchModeAuto
+	base.Request.Question = "  canonical question  "
+	base.Request.RequestedSources = []string{" chatlog ", ResearchSourceKnowledge}
+	base.Request.SubjectIDs = []string{" subject-b ", "subject-a", "subject-a"}
+	baseHash, err := hashResearchRunInput(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := base
+	canonical.Request.Question = "canonical question"
+	canonical.Request.RequestedSources = []string{ResearchSourceKnowledge, ResearchSourceChatlog}
+	canonical.Request.SubjectIDs = []string{"subject-a", "subject-b"}
+	canonical.IdempotencyKey = "different-derived-key"
+	canonical.Mode = ResearchModeDeep
+	canonical.RouteReasons = []string{ResearchRoutePrivateHistory, ResearchRouteConflict}
+	canonical.Budget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 16000, MaxModelCalls: 8, MaxCostUSD: 2}
+	canonicalHash, err := hashResearchRunInput(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalHash != baseHash {
+		t.Fatalf("derived/canonical drift changed hash: %s != %s", canonicalHash, baseHash)
+	}
+	changed := canonical
+	changed.Request.SubjectIDs = []string{"subject-c"}
+	changedHash, err := hashResearchRunInput(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedHash == baseHash {
+		t.Fatal("client subject change reused confirmation hash")
+	}
+	empty := researchStoreTestInput("canonical-empty")
+	empty.Request.RequestedSources = nil
+	empty.Request.SubjectIDs = nil
+	emptyHash, err := hashResearchRunInput(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty.Request.RequestedSources = []string{}
+	empty.Request.SubjectIDs = []string{}
+	explicitEmptyHash, err := hashResearchRunInput(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitEmptyHash != emptyHash {
+		t.Fatalf("nil/empty changed hash: %s != %s", explicitEmptyHash, emptyHash)
+	}
+}
+
+func TestResearchStoreImmediateWriterDoesNotBlockCrossHandleReader(t *testing.T) {
+	root := t.TempDir()
+	storeA, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storeA.Close() })
+	run := insertResearchRunFixtureForTest(t, storeA, researchStoreTestInput("reader-during-writer"))
+	storeB, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storeB.Close() })
+	tx, err := storeA.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	loaded := make(chan error, 1)
+	go func() {
+		_, loadErr := storeB.LoadRun(run.RunID)
+		loaded <- loadErr
+	}()
+	select {
+	case err := <-loaded:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("immediate writer blocked a cross-handle reader")
+	}
+}
+
+func TestResearchStoreLoadRunRejectsNonCanonicalPersistedLinks(t *testing.T) {
+	for _, test := range []struct {
+		name, column, value string
+	}{
+		{name: "parent", column: "parent_run_id", value: "../sensitive-parent"},
+		{name: "preflight", column: "preflight_id", value: "../sensitive-preflight"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := newResearchStoreForTest(t)
+			run := createResearchRunForTest(t, store, "corrupt-link-"+test.name)
+			if _, err := store.db.Exec(`UPDATE research_runs SET `+test.column+` = ? WHERE run_id = ?`, test.value, run.RunID); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := store.LoadRun(run.RunID)
+			if loaded != nil || !errors.Is(err, ErrResearchPreflightCorrupt) {
+				t.Fatalf("loaded=%#v error=%v", loaded, err)
+			}
+			if strings.Contains(err.Error(), test.value) {
+				t.Fatalf("corrupt link leaked value: %v", err)
+			}
+		})
+	}
+}
+
 func TestResearchStoreTransitionsRunAndEventAtomically(t *testing.T) {
 	store := newResearchStoreForTest(t)
 	run := createResearchRunForTest(t, store, "transition-request")

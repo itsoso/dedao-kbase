@@ -231,7 +231,7 @@ deep_preflight_response="$smoke_root/deep-preflight.json"
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $auth_token" \
   -H 'Content-Type: application/json' \
-  --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"requested_sources\":[\"chatlog\"],\"package_constraint\":\"$research_package_id\"}" \
+  --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"],\"package_constraint\":\"$research_package_id\"}" \
   "$kbase_url/api/research/preflight" >"$deep_preflight_response"
 deep_preflight_id="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); expected=(sys.argv[2],sys.argv[3]); candidates={(item["package_id"],item["package_version"]):item for item in value["candidates"]}; assert value["status"]=="ready" and expected in candidates and candidates[expected]["readiness"] in ("pass","warning"); print(value["preflight_id"])' "$deep_preflight_response" "$research_package_id" "$research_package_version")"
 

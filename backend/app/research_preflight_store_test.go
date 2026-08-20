@@ -2,7 +2,10 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -95,7 +98,7 @@ func TestResearchPreflightStoreMigrationContainsNoRawQuestionColumns(t *testing.
 	}
 	for _, required := range []string{
 		"preflight_id", "owner_hash", "request_hash", "status", "candidates_json",
-		"checks_json", "gaps_json", "mode", "requested_sources_json", "package_constraint",
+		"checks_json", "gaps_json", "mode", "requested_sources_json", "subject_ids_json", "package_constraint",
 		"parent_run_id", "bound_run_id", "created_at", "expires_at",
 	} {
 		if !columns[required] {
@@ -137,10 +140,7 @@ func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(
 	}
 	legacyInput := researchStoreTestInput("legacy-migrated-run")
 	legacyInput.Request.PreflightID = ""
-	legacyHash, err := hashResearchRunInput(legacyInput)
-	if err != nil {
-		t.Fatal(err)
-	}
+	legacyHash := hashLegacyResearchRunInput(t, legacyInput)
 	legacyRun := ResearchRun{
 		SchemaVersion: ResearchRunSchemaVersion, RunID: "research-run-legacy-migrated",
 		Mode: ResearchModeQuick, Question: "legacy migrated question", Status: ResearchPlanning,
@@ -170,10 +170,7 @@ func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(
 		Mode: ResearchModeQuick, Question: "legacy confirmation question",
 		RequestedSources: []string{ResearchSourceKnowledge}, PackageConstraint: "candidate-a",
 	}
-	legacyPreflightHash, err := hashResearchPreflightRequest(legacyRequest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	legacyPreflightHash := hashLegacyResearchPreflightRequestV1(t, legacyRequest)
 	legacyPreflight := testResearchPreflight()
 	legacyPreflight.PreflightID = "research-preflight-legacy-migrated"
 	legacyPreflight.RequestHash = legacyPreflightHash
@@ -209,6 +206,7 @@ func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(
 		{table: "research_runs", column: "parent_run_id"},
 		{table: "research_runs", column: "preflight_id"},
 		{table: "research_preflights", column: "bound_run_id"},
+		{table: "research_preflights", column: "subject_ids_json"},
 	} {
 		var count int
 		if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, target.table, target.column).Scan(&count); err != nil {
@@ -290,6 +288,70 @@ func TestResearchRunRequiresPreflightMigrationEnforcesUniqueNonEmptyBinding(t *t
 	}
 }
 
+func TestResearchRunRequiresPreflightMigrationRejectsDirtyDuplicateBindingsWithoutDataLoss(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DROP INDEX idx_research_runs_preflight_binding`); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(runID, key string) {
+		t.Helper()
+		if _, err := store.db.Exec(`INSERT INTO research_runs (
+			run_id, preflight_id, idempotency_key, request_hash, schema_version, mode, question, status,
+			version, created_at, updated_at
+		) VALUES (?, 'research-preflight-dirty-duplicate', ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+			runID, key, "sha256:"+strings.Repeat("d", 64), ResearchRunSchemaVersion,
+			ResearchModeQuick, "dirty migration fixture", ResearchPlanning,
+			"2026-08-19T12:00:00Z", "2026-08-19T12:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("research-run-dirty-a", "dirty-a")
+	insert("research-run-dirty-b", "dirty-b")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		reopened, openErr := OpenResearchStore(root, time.Now)
+		if reopened != nil {
+			_ = reopened.Close()
+		}
+		if !errors.Is(openErr, ErrResearchPreflightCorrupt) ||
+			!strings.Contains(openErr.Error(), "research-preflight-dirty-duplicate") ||
+			!strings.Contains(openErr.Error(), "2") {
+			t.Fatalf("attempt %d migration error=%v", attempt, openErr)
+		}
+	}
+	inspection, err := sql.Open("sqlite3", filepath.Join(root, researchStoreDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inspection.Close()
+	rows, err := inspection.Query(`SELECT run_id FROM research_runs WHERE preflight_id = ? ORDER BY run_id`, "research-preflight-dirty-duplicate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var runIDs []string
+	for rows.Next() {
+		var runID string
+		if err := rows.Scan(&runID); err != nil {
+			t.Fatal(err)
+		}
+		runIDs = append(runIDs, runID)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(runIDs, []string{"research-run-dirty-a", "research-run-dirty-b"}) {
+		t.Fatalf("dirty migration modified rows: %#v", runIDs)
+	}
+}
+
 func TestResearchRunRequiresPreflightRejectsEveryMismatchWithoutRunRows(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -313,6 +375,9 @@ func TestResearchRunRequiresPreflightRejectsEveryMismatchWithoutRunRows(t *testi
 		}, want: ErrResearchPreflightRequestChanged},
 		{name: "sources changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
 			value.Input.Request.RequestedSources = nil
+		}, want: ErrResearchPreflightRequestChanged},
+		{name: "subjects changed", mutate: func(_ *testing.T, _ *ResearchStore, value *ResearchRunConfirmation) {
+			value.Input.Request.SubjectIDs = []string{"subject-other"}
 		}, want: ErrResearchPreflightRequestChanged},
 		{name: "package constraint changed", mutate: func(t *testing.T, store *ResearchStore, value *ResearchRunConfirmation) {
 			if _, err := store.db.Exec(`UPDATE research_preflights SET package_constraint = ? WHERE preflight_id = ?`, "candidate-other", value.Input.Request.PreflightID); err != nil {
@@ -519,6 +584,28 @@ func TestResearchRunRequiresPreflightBoundReplaySurvivesExpiryWithoutRenewingSna
 	replayed, wasCreated, err := store.ConfirmResearchRun(confirmation)
 	if err != nil || wasCreated || replayed.RunID != created.RunID {
 		t.Fatalf("expired replay=%#v created=%v error=%v", replayed, wasCreated, err)
+	}
+}
+
+func TestResearchRunRequiresPreflightReplayIgnoresDerivedDecisionDrift(t *testing.T) {
+	store := openResearchRunConfirmationStore(t)
+	confirmation := saveResearchRunConfirmationPreflight(t, store, "")
+	created, wasCreated, err := store.ConfirmResearchRun(confirmation)
+	if err != nil || !wasCreated {
+		t.Fatalf("create=%#v created=%v error=%v", created, wasCreated, err)
+	}
+	replayInput := confirmation.Input
+	replayInput.Mode = ResearchModeDeep
+	replayInput.RouteReasons = []string{ResearchRouteConflict, ResearchRouteCrossSource}
+	replayInput.Budget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 16000, MaxModelCalls: 8, MaxCostUSD: 2}
+	replayed, found, err := store.ReplayConfirmedResearchRun(confirmation.OwnerHash, replayInput)
+	if err != nil || !found || replayed.RunID != created.RunID || replayed.Budget != created.Budget {
+		t.Fatalf("derived drift replay=%#v found=%v error=%v", replayed, found, err)
+	}
+	changedClientInput := replayInput
+	changedClientInput.Request.Question = "changed client question"
+	if replayed, found, err := store.ReplayConfirmedResearchRun(confirmation.OwnerHash, changedClientInput); replayed != nil || found || !errors.Is(err, ErrResearchRunIdempotencyConflict) {
+		t.Fatalf("changed client payload replay=%#v found=%v error=%v", replayed, found, err)
 	}
 }
 
@@ -1061,7 +1148,7 @@ func TestResearchPreflightStoreRequestHashIsStableAndCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const expected = "sha256:ac59b2ab14219c87c2f7dc6f1545d04423862362e9e379ceeec33ee14f402687"
+	const expected = "sha256:dc5bb472085ee071869d7e9d326edefbae309e5b87a2450581ae4b2519bd04d0"
 	if requestHash != expected {
 		t.Fatalf("request hash = %q, want %q", requestHash, expected)
 	}
@@ -1227,4 +1314,40 @@ func testResearchPreflightStoreRequest() ResearchPreflightRequest {
 
 func testResearchPreflightOwnerHash(digit string) string {
 	return strings.Repeat(digit, 64)
+}
+
+func hashLegacyResearchRunInput(t *testing.T, input ResearchRunInput) string {
+	t.Helper()
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func hashLegacyResearchPreflightRequestV1(t *testing.T, request ResearchPreflightRequest) string {
+	t.Helper()
+	normalized, err := NormalizeResearchPreflightRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := struct {
+		SchemaVersion     string   `json:"schema_version"`
+		Question          string   `json:"question"`
+		Mode              string   `json:"mode"`
+		RequestedSources  []string `json:"requested_sources"`
+		PackageConstraint string   `json:"package_constraint"`
+		ParentRunID       string   `json:"parent_run_id"`
+	}{
+		SchemaVersion: "research-preflight-request/v1", Question: normalized.Question,
+		Mode: normalized.Mode, RequestedSources: normalized.RequestedSources,
+		PackageConstraint: normalized.PackageConstraint, ParentRunID: normalized.ParentRunID,
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:])
 }

@@ -180,6 +180,9 @@ func ValidateResearchRunRequest(request ResearchRunRequest) error {
 	if len(request.SubjectIDs) > researchSubjectIDsMax {
 		return fmt.Errorf("subject_ids exceeds %d items", researchSubjectIDsMax)
 	}
+	if _, err := normalizeResearchSubjectIDs(request.SubjectIDs); err != nil {
+		return err
+	}
 	return nil
 }
 

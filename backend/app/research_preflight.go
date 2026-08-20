@@ -39,6 +39,7 @@ type ResearchPreflightRequest struct {
 	Mode              string   `json:"mode"`
 	Question          string   `json:"question"`
 	RequestedSources  []string `json:"requested_sources,omitempty"`
+	SubjectIDs        []string `json:"subject_ids,omitempty"`
 	PackageConstraint string   `json:"package_constraint,omitempty"`
 	ParentRunID       string   `json:"parent_run_id,omitempty"`
 }
@@ -225,8 +226,33 @@ func NormalizeResearchPreflightRequest(request ResearchPreflightRequest) (Resear
 		return researchPreflightSourceOrder(normalizedSources[left]) < researchPreflightSourceOrder(normalizedSources[right])
 	})
 	request.RequestedSources = normalizedSources
+	normalizedSubjects, err := normalizeResearchSubjectIDs(request.SubjectIDs)
+	if err != nil {
+		return ResearchPreflightRequest{}, err
+	}
+	request.SubjectIDs = normalizedSubjects
 
 	return request, nil
+}
+
+func normalizeResearchSubjectIDs(values []string) ([]string, error) {
+	if len(values) > researchSubjectIDsMax {
+		return nil, fmt.Errorf("subject_ids exceeds %d items", researchSubjectIDsMax)
+	}
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" || len([]rune(value)) > researchPackageIDMaxRunes || !validResearchPreflightResourceID(value) {
+			return nil, fmt.Errorf("subject_ids must contain bounded canonical Research resource IDs")
+		}
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func ValidateResearchPreflight(preflight ResearchPreflight) error {
