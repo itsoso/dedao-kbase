@@ -87,10 +87,93 @@ assert.equal(controller.isCurrent(secondRequest.sequence, secondRequest.fingerpr
 controller.cancel();
 assert.equal(secondRequest.signal.aborted, true, "route changes should abort the current preflight request");
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+const routeDraft = { question: "比较同一问题", mode: "auto", sources: ["knowledge"], subjectIDs: [], packageConstraint: "agent-old" };
+const routeState = {
+  draft: routeDraft,
+  preflight: { preflight_id: "old-preflight", candidates: [{ package_id: "agent-old", package_version: "1.0.0" }] },
+  preflightFingerprint: "old-fingerprint",
+  selectedCandidateKey: "agent-old\u00001.0.0",
+  runSubmission: { fingerprint: "old-submission", idempotencyKey: "research-ui:old" },
+  loading: { preflight: false },
+  error: "",
+  message: "",
+};
+const routeController = createResearchPreflightRequestController();
+const routeFetches = [];
+const routeTimers = new Map();
+const oldPreflightResponse = deferred();
+const newPreflightResponse = deferred();
+const newPreflightApplied = deferred();
+let nextRouteTimerID = 0;
+const routeRuntime = loadFunctions([
+  "researchSourceOrder", "normalizeResearchDraft", "researchDraftFingerprint", "researchCandidateKey",
+  "selectResearchPreflightCandidate", "applyResearchPreflightResponse", "markResearchPreflightPending",
+  "clearResearchRunSubmission", "clearResearchPreflightTimers", "cancelResearchPreflightLifecycle", "scheduleResearchPreflight",
+  "requestResearchPreflight", "synchronizeResearchRouteConstraint",
+], {
+  researchState: routeState,
+  researchPreflightRequestController: routeController,
+  researchPreflightDebounceMS: 600,
+  researchPreflightDebounceTimer: null,
+  researchPreflightExpiryTimer: null,
+  clearTimeout: (timerID) => routeTimers.delete(timerID),
+  window: { setTimeout: (callback) => { nextRouteTimerID += 1; routeTimers.set(nextRouteTimerID, callback); return nextRouteTimerID; } },
+  document: { querySelector: () => null },
+  getResearchRoute: () => ({ runID: "" }),
+  renderResearchWorkspacePreservingDraftFocus: () => {},
+  researchPreflightErrorMessage: () => "预检失败",
+  scheduleResearchPreflightExpiry: () => newPreflightApplied.resolve(),
+  apiFetch: async (url, options) => {
+    routeFetches.push({ url, options, body: JSON.parse(options.body) });
+    return routeFetches.length === 1 ? oldPreflightResponse.promise : newPreflightResponse.promise;
+  },
+});
+const oldRequestCompletion = routeRuntime.requestResearchPreflight(routeDraft);
+assert.equal(routeState.loading.preflight, true, "the original constrained preflight should be loading");
+assert.equal(routeRuntime.synchronizeResearchRouteConstraint("agent-new"), true, "a changed route constraint should schedule a replacement preflight");
+assert.equal(routeFetches[0].options.signal.aborted, true, "changing the route constraint should abort the in-flight request immediately");
+assert.equal(routeState.loading.preflight, false, "canceling the old request should release its loading state before the replacement starts");
+assert.equal(routeState.preflight, null, "changing the route constraint should clear the old preflight snapshot");
+assert.equal(routeState.selectedCandidateKey, "", "changing the route constraint should clear the old Agent selection");
+assert.equal(routeState.runSubmission, null, "changing the route constraint should clear the old run submission identity");
+assert.equal(routeTimers.size, 1, "the changed constraint should schedule one replacement preflight");
+const replacementTimer = [...routeTimers.values()][0];
+replacementTimer();
+assert.equal(routeFetches.length, 2, "the scheduled replacement should request a new preflight");
+assert.equal(routeFetches[1].body.package_constraint, "agent-new", "the replacement preflight should use the new route constraint");
+const newRouteFingerprint = routeRuntime.researchDraftFingerprint({ ...routeDraft, packageConstraint: "agent-new" });
+oldPreflightResponse.resolve({ preflight_id: "stale-preflight", status: "ready", expires_at: "2099-01-01T00:00:00Z", candidates: [{ package_id: "agent-old", package_version: "1.0.0" }], checks: [] });
+await oldRequestCompletion;
+assert.equal(routeState.preflight, null, "the aborted request response must not restore the old snapshot");
+assert.equal(routeState.loading.preflight, true, "the aborted request finally must not clear the replacement request loading state");
+newPreflightResponse.resolve({ preflight_id: "new-preflight", status: "ready", expires_at: "2099-01-01T00:00:00Z", candidates: [{ package_id: "agent-new", package_version: "2.0.0" }], checks: [] });
+await newPreflightApplied.promise;
+await Promise.resolve();
+assert.equal(routeState.preflight?.preflight_id, "new-preflight", "the replacement response should become the active preflight");
+assert.equal(routeState.preflightFingerprint, newRouteFingerprint, "the replacement preflight should bind to the new draft fingerprint");
+assert.equal(routeState.loading.preflight, false, "the replacement request should release loading after it applies");
+routeState.selectedCandidateKey = "agent-new\u00002.0.0";
+routeRuntime.scheduleResearchPreflight({ ...routeState.draft, question: "比较同一问题的新范围" });
+assert.equal(routeState.selectedCandidateKey, "agent-new\u00002.0.0", "ordinary draft edits should preserve a manual selection for reuse when the next candidate set still contains it");
+assert.equal(routeRuntime.synchronizeResearchRouteConstraint(""), true, "removing the route constraint should invalidate the constrained snapshot");
+assert.equal(routeState.draft.packageConstraint, undefined, "leaving a constrained Research URL should remove the hidden Package constraint from the draft");
+assert.equal(routeState.selectedCandidateKey, "", "removing the route constraint should clear the constrained Agent selection");
+
 const behavior = loadFunctions([
   "researchSourceOrder", "normalizeResearchDraft", "researchDraftFingerprint", "researchCandidateKey",
   "selectResearchPreflightCandidate", "applyResearchPreflightResponse", "researchRunStartBlockReason",
   "researchSelectedCandidate", "researchPreflightNotice", "researchSourceLabel", "buildResearchRunRequest", "prepareResearchRunSubmission",
+  "clearResearchRunSubmission",
 ]);
 const draft = behavior.normalizeResearchDraft({
   question: "  比较两类证据  ", mode: " auto ",
@@ -122,8 +205,12 @@ assert.equal(
 assert.equal(state.preflight.candidates.length, 3, "the UI must cap recommendation cards at three");
 assert.equal(state.selectedCandidateKey, "agent-one\u00001.2.0", "a new preflight should select the first candidate");
 state.selectedCandidateKey = "agent-two\u00002.0.0";
+state.runSubmission = { fingerprint: "stale-submission", idempotencyKey: "research-ui:stale" };
+state.message = "旧的创建失败提示";
 behavior.applyResearchPreflightResponse(state, activeController, { sequence: 2, fingerprint }, { preflight_id: "fresh-2", status: "ready", expires_at: "2099-01-01T00:00:00Z", candidates: candidates.slice(1), checks: [] }, draft);
 assert.equal(state.selectedCandidateKey, "agent-two\u00002.0.0", "a manual selection should survive when the new candidate set still contains it");
+assert.equal(state.runSubmission, null, "applying a new preflight should clear the prior submission identity");
+assert.equal(state.message, "", "applying a fresh preflight should clear a stale run-creation message");
 
 const mixedPreflight = {
   ...state.preflight,
@@ -175,21 +262,27 @@ assert.deepEqual(JSON.parse(JSON.stringify(runPayload)), {
 const afterPreflight = behavior.prepareResearchRunSubmission(draft, state, Date.parse("2026-08-20T00:00:00Z"));
 assert.deepEqual(JSON.parse(JSON.stringify(afterPreflight.payload)), JSON.parse(JSON.stringify(runPayload)), "the submission gate should release the exact run payload only after preflight");
 
-async function executeCreateResearchRun(initialState) {
+function createResearchRunRuntime(initialState, outcomes = [{ run: { run_id: "run-created" } }]) {
   const requests = [];
   const runtimeState = JSON.parse(JSON.stringify(initialState));
+  let requestIndex = 0;
+  let idempotencyIndex = 0;
   const runtime = loadFunctions([
     "researchSourceOrder", "normalizeResearchDraft", "researchDraftFingerprint", "researchCandidateKey",
     "researchSelectedCandidate", "researchRunStartBlockReason", "buildResearchRunRequest",
-    "prepareResearchRunSubmission", "postResearchRunSubmission", "createResearchRun",
+    "prepareResearchRunSubmission", "researchRunSubmissionFingerprint", "researchRunIdempotencyKey",
+    "clearResearchRunSubmission", "postResearchRunSubmission", "createResearchRun",
   ], {
     researchState: runtimeState,
     researchDraftFromForm: () => draft,
     apiFetch: async (url, options) => {
-      requests.push({ url, method: options?.method, body: JSON.parse(options?.body || "null") });
-      return { run: { run_id: "run-created" } };
+      requests.push({ url, method: options?.method, headers: { ...options?.headers }, body: JSON.parse(options?.body || "null") });
+      const outcome = outcomes[Math.min(requestIndex, outcomes.length - 1)];
+      requestIndex += 1;
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
     },
-    researchRequestID: () => "request-fixed",
+    researchRequestID: () => { idempotencyIndex += 1; return `request-${idempotencyIndex}`; },
     renderResearchWorkspace: () => {},
     rememberResearchRun: () => {},
     window: { history: { pushState: () => {} } },
@@ -200,8 +293,17 @@ async function executeCreateResearchRun(initialState) {
     scheduleResearchPreflight: () => {},
     getResearchRoute: () => null,
   });
-  await runtime.createResearchRun({ preventDefault() {}, currentTarget: {} });
-  return { requests, state: runtimeState };
+  return {
+    requests,
+    state: runtimeState,
+    invoke: () => runtime.createResearchRun({ preventDefault() {}, currentTarget: {} }),
+  };
+}
+
+async function executeCreateResearchRun(initialState) {
+  const execution = createResearchRunRuntime(initialState);
+  await execution.invoke();
+  return execution;
 }
 
 const missingPreflightExecution = await executeCreateResearchRun({
@@ -225,6 +327,29 @@ assert.equal(runRequests.length, 1, "a ready confirmed preflight should POST exa
 assert.equal(runRequests[0].method, "POST", "the ready submission should use POST for run creation");
 assert.deepEqual(JSON.parse(JSON.stringify(runRequests[0].body)), JSON.parse(JSON.stringify(runPayload)), "the executed run POST should preserve the exact preflight-bound normalized payload");
 
+const retryExecution = createResearchRunRuntime({
+  preflight: state.preflight, preflightFingerprint: fingerprint, runSubmission: null,
+  selectedCandidateKey: state.selectedCandidateKey, loading: { preflight: false, create: false }, message: "", draft,
+}, [new Error("network response unknown"), { run: { run_id: "run-after-retry" } }, { run: { run_id: "run-new-preflight" } }]);
+await retryExecution.invoke();
+await retryExecution.invoke();
+assert.equal(retryExecution.requests.length, 2, "an uncertain first result followed by retry should execute two run POST attempts");
+assert.equal(retryExecution.requests[0].headers["Idempotency-Key"], retryExecution.requests[1].headers["Idempotency-Key"], "an uncertain retry of the same submission should reuse its idempotency key");
+assert.deepEqual(retryExecution.requests[0].body, retryExecution.requests[1].body, "an uncertain retry should preserve the canonical run payload");
+const confirmedKey = retryExecution.requests[1].headers["Idempotency-Key"];
+assert.equal(retryExecution.state.runSubmission, null, "a confirmed successful run should clear the cached submission identity");
+retryExecution.state.preflight = { ...state.preflight, preflight_id: "fresh-3" };
+await retryExecution.invoke();
+assert.notEqual(retryExecution.requests[2].headers["Idempotency-Key"], confirmedKey, "a new preflight payload should receive a new idempotency key");
+assert.equal(retryExecution.requests[2].body.preflight_id, "fresh-3", "the new idempotency key should bind to the new preflight payload");
+
+const conflictExecution = createResearchRunRuntime({
+  preflight: state.preflight, preflightFingerprint: fingerprint, runSubmission: null,
+  selectedCandidateKey: state.selectedCandidateKey, loading: { preflight: false, create: false }, message: "", draft,
+}, [new Error("research_idempotency_conflict")]);
+await conflictExecution.invoke();
+assert.equal(conflictExecution.state.runSubmission, null, "an authoritative idempotency conflict should clear the cached submission identity");
+
 const debounceMatch = js.match(/const researchPreflightDebounceMS = (\d+);/);
 assert.equal(Number(debounceMatch?.[1]), 600, "preflight should wait 600ms after draft edits");
 const preflightRequest = functionSource("requestResearchPreflight");
@@ -237,7 +362,7 @@ assert.doesNotMatch(createRun, /apiFetch\(/, "run creation should cross the mock
 assert.ok(createRun.includes('["preflight_required",'), "a server-side missing-preflight response should invalidate and refresh the local snapshot");
 const boot = functionSource("boot");
 assert.ok(boot.includes("cancelResearchPreflightLifecycle"), "route changes should clear the debounce timer and abort preflight requests");
-assert.ok(boot.includes("else delete researchState.draft.packageConstraint"), "leaving a constrained deep link should not retain a hidden Package constraint");
+assert.ok(boot.includes("synchronizeResearchRouteConstraint"), "Research route handling should use the tested constraint lifecycle");
 
 const launchpad = js.match(/<form class="research-launchpad"[\s\S]*?<\/form>/)?.[0] || "";
 assert.doesNotMatch(launchpad, /name="package_id"|name="package_version"/, "normal Research flow must not expose raw Package identity inputs");

@@ -363,6 +363,7 @@ const researchState = {
   preflight: null,
   preflightFingerprint: "",
   selectedCandidateKey: "",
+  runSubmission: null,
   parentRunID: "",
   recentRuns: [],
   detail: null,
@@ -11528,11 +11529,13 @@ function applyResearchPreflightResponse(state, controller, request, payload, dra
   const fingerprint = researchDraftFingerprint(draft);
   if (!controller.isCurrent(request.sequence, request.fingerprint) || request.fingerprint !== fingerprint) return false;
   const bounded = { ...payload, candidates: (Array.isArray(payload?.candidates) ? payload.candidates : []).slice(0, 3) };
+  clearResearchRunSubmission(state);
   state.preflight = bounded;
   state.preflightFingerprint = fingerprint;
   state.selectedCandidateKey = selectResearchPreflightCandidate(state.selectedCandidateKey, bounded.candidates);
   state.loading.preflight = false;
   state.error = "";
+  state.message = "";
   return true;
 }
 
@@ -11586,6 +11589,10 @@ function prepareResearchRunSubmission(draft, state, now = Date.now()) {
   const candidate = researchSelectedCandidate(state?.preflight, state?.selectedCandidateKey);
   if (blockReason || !candidate) return { blockReason: blockReason || "请确认一个推荐 Agent。", candidate: null, payload: null };
   return { blockReason: "", candidate, payload: buildResearchRunRequest(draft, state.preflight, candidate) };
+}
+
+function clearResearchRunSubmission(state = researchState) {
+  state.runSubmission = null;
 }
 
 function researchPreflightErrorMessage(error) {
@@ -11914,6 +11921,7 @@ function cancelResearchPreflightLifecycle(clearSnapshot = true) {
   if (!clearSnapshot) return;
   researchState.preflight = null;
   researchState.preflightFingerprint = "";
+  clearResearchRunSubmission(researchState);
   researchState.error = "";
 }
 
@@ -11927,6 +11935,14 @@ function scheduleResearchPreflight(draft, delay = researchPreflightDebounceMS) {
     researchPreflightDebounceTimer = null;
     requestResearchPreflight(normalized);
   }, delay);
+}
+
+function synchronizeResearchRouteConstraint(packageID) {
+  const nextDraft = { ...researchState.draft, packageConstraint: String(packageID || "").trim() };
+  if (researchDraftFingerprint(nextDraft) === researchDraftFingerprint(researchState.draft)) return false;
+  scheduleResearchPreflight(nextDraft, 0);
+  researchState.selectedCandidateKey = "";
+  return true;
 }
 
 function scheduleResearchPreflightExpiry(preflight, fingerprint) {
@@ -11981,10 +11997,39 @@ function researchRequestID() {
   return window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function researchRunSubmissionFingerprint(payload) {
+  const normalized = normalizeResearchDraft({
+    mode: payload?.mode,
+    question: payload?.question,
+    sources: payload?.requested_sources,
+    subjectIDs: payload?.subject_ids,
+  });
+  return JSON.stringify({
+    preflight_id: String(payload?.preflight_id || ""),
+    mode: normalized.mode,
+    question: normalized.question,
+    requested_sources: normalized.sources,
+    subject_ids: normalized.subjectIDs,
+    package_id: String(payload?.package_id || ""),
+    package_version: String(payload?.package_version || ""),
+  });
+}
+
+function researchRunIdempotencyKey(state, payload) {
+  const fingerprint = researchRunSubmissionFingerprint(payload);
+  if (state.runSubmission?.fingerprint === fingerprint && state.runSubmission.idempotencyKey) {
+    return state.runSubmission.idempotencyKey;
+  }
+  const idempotencyKey = `research-ui:${researchRequestID()}`;
+  state.runSubmission = { fingerprint, idempotencyKey };
+  return idempotencyKey;
+}
+
 async function postResearchRunSubmission(payload) {
+  const idempotencyKey = researchRunIdempotencyKey(researchState, payload);
   return apiFetch("/api/research/runs", {
     method: "POST",
-    headers: { "Idempotency-Key": `research-ui:${researchRequestID()}` },
+    headers: { "Idempotency-Key": idempotencyKey },
     body: JSON.stringify(payload),
   });
 }
@@ -12005,6 +12050,7 @@ async function createResearchRun(event) {
     const payload = await postResearchRunSubmission(submission.payload);
     const runID = payload?.run?.run_id;
     if (!runID) throw new Error("服务器未返回研究运行 ID");
+    clearResearchRunSubmission(researchState);
     rememberResearchRun(runID);
     window.history.pushState({}, "", buildResearchRunURL(runID));
     clearResearchRunDetail(runID);
@@ -12012,6 +12058,7 @@ async function createResearchRun(event) {
   } catch (error) {
     researchState.message = researchCreateErrorMessage(error);
     const code = String(error?.message || error || "");
+    if (code === "research_idempotency_conflict") clearResearchRunSubmission(researchState);
     if (["preflight_required", "research_preflight_not_found", "research_preflight_expired", "preflight_expired", "package_changed", "readiness_changed", "preflight_blocked", "research_preflight_conflict"].includes(code)) {
       scheduleResearchPreflight(researchState.draft, 0);
     }
@@ -12200,11 +12247,10 @@ async function boot() {
       renderResearchWorkspace(researchRoute);
       await Promise.all([loadResearchRun(researchRoute.runID), pollResearchEvents(researchRoute.runID)]);
     } else {
-      if (researchRoute.packageID) researchState.draft.packageConstraint = researchRoute.packageID;
-      else delete researchState.draft.packageConstraint;
+      const constraintChanged = synchronizeResearchRouteConstraint(researchRoute.packageID);
       clearResearchRunDetail();
       renderResearchWorkspace(researchRoute);
-      if (researchState.draft.question && !researchState.preflight && !researchState.loading.preflight) scheduleResearchPreflight(researchState.draft, 0);
+      if (!constraintChanged && researchState.draft.question && !researchState.preflight && !researchState.loading.preflight) scheduleResearchPreflight(researchState.draft, 0);
       await loadRecentResearchRuns();
     }
     return;
