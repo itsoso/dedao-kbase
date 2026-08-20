@@ -580,4 +580,3 @@ git push dedao-kbase HEAD:main
 ~~~
 
 Expected: G5/G6 PASS and canonical main contains only privacy-safe rollout evidence.
-
