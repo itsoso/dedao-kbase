@@ -367,6 +367,7 @@ const researchState = {
   parentRunID: "",
   recentRuns: [],
   detail: null,
+  detailOwnerVisible: false,
   events: [],
   nextSequence: 0,
   activeTab: "evidence",
@@ -1702,7 +1703,7 @@ function getResearchRoute(pathname = getRoutePathname()) {
 }
 
 function buildResearchRunURL(runID) {
-  return runID ? `${ROUTES.research}/runs/${encodeURIComponent(runID)}` : ROUTES.research;
+  return isCanonicalResearchRunID(runID) ? `${ROUTES.research}/runs/${encodeURIComponent(runID)}` : ROUTES.research;
 }
 
 function isBookAgentActionCurrent(sequence, actionRoute) {
@@ -11477,6 +11478,27 @@ function researchFailurePresentation(failure) {
   return ({ worker_offline: ["本地 Worker 未在线", "确认 macOS Worker 已启动并连接后，再新建一次研究。"], worker_failed: ["本地 Worker 执行失败", "Worker 已连接，但本地查询或返回数据失败；请在 Agent 健康页检查 Chatlog 服务后重试。"], identity_ambiguous: ["身份仍有歧义", "在身份候选区确认正确对象；不要仅凭昵称推断。"], zero_hit: ["没有找到可用证据", "调整关键词、时间范围或增加一个允许的数据源。"], partial_evidence: ["只取得部分证据", "报告会保留缺口，不会把缺失部分补写成事实。"], budget_exhausted: ["研究预算已用完", "缩小问题范围，或新建深度研究并提高受控预算。"], citation_mismatch: ["引用核验未通过", "检查来源是否发生变化后重新运行。"], source_changed: ["来源内容已变化", "重新检索并生成新的可核验快照。"], model_timeout: ["模型调用超时", "稍后重试；已完成步骤不会被描述为最终结论。"], planner_invalid_output: ["研究规划输出无效", "系统已自动修复一次，但规划结果仍不符合工具和结构约束；请检查规划模型后重试。"], extractor_invalid_output: ["事实提取输出无效", "系统已自动修复一次，但事实或引用仍未通过严格校验；请检查提取模型后重试。"], synthesizer_invalid_output: ["研究综合输出无效", "系统已自动修复一次，但结论结构或证据引用仍无效；请检查综合模型后重试。"], verifier_invalid_output: ["引用核验输出无效", "系统已自动修复一次，但核验结果仍不符合结论引用约束；请检查核验模型后重试。"], invalid_model_output: ["模型输出格式无效", "系统已终止本次运行且不会重复执行；请检查角色模型或稍后新建研究。"] })[code] || ["研究未能完成", "查看阶段记录并缩小范围后重新发起。"];
 }
 
+function researchLinkedRetrySuggestion(failure) {
+  const code = String(failure?.code || "");
+  return ({
+    worker_offline: "启动并连接 macOS Worker，再刷新运行条件。",
+    worker_failed: "先检查 Agent 健康状态，再运行一次独立研究。",
+    identity_ambiguous: "明确研究对象或身份边界后，再运行一次独立研究。",
+    zero_hit: "扩大检索范围或补充一个允许来源，再运行一次独立研究。",
+    partial_evidence: "扩大检索范围或启用更多允许来源，再运行一次独立研究。",
+    budget_exhausted: "缩小问题范围或选择合适模式，再运行一次独立研究。",
+    citation_mismatch: "刷新已变化的来源后，再运行一次引用核验。",
+    source_changed: "刷新已变化的来源后，再运行一次独立研究。",
+    model_timeout: "保持已确认范围，稍后重新预检并运行。",
+    planner_invalid_output: "检查规划模型状态后，重新预检并运行。",
+    extractor_invalid_output: "检查提取模型状态后，重新预检并运行。",
+    synthesizer_invalid_output: "检查综合模型状态后，重新预检并运行。",
+    verifier_invalid_output: "检查核验模型状态后，重新预检并运行。",
+    invalid_model_output: "检查角色模型状态后，重新预检并运行。",
+    policy_denied: "调整为 Agent 允许的来源或模式，再重新预检。",
+  })[code] || "";
+}
+
 function researchSourceOrder(source) {
   return ({ knowledge: 0, chatlog: 1, prior_runs: 2 })[source] ?? 99;
 }
@@ -11517,6 +11539,30 @@ function researchDraftFingerprint(draft) {
 
 function researchCandidateKey(candidate) {
   return `${String(candidate?.package_id || "")}\u0000${String(candidate?.package_version || "")}`;
+}
+
+function researchLinkedRetryPlan(detail, ownerVisible) {
+  const run = detail?.run;
+  if (!ownerVisible || !run || !["failed", "insufficient"].includes(String(run.status || ""))) return null;
+  const suggestion = researchLinkedRetrySuggestion(run.failure);
+  const parentRunID = typeof run.run_id === "string" ? run.run_id : "";
+  const packageID = String(run.package_id || "").trim();
+  const packageVersion = String(run.package_version || "").trim();
+  if (!suggestion || !isCanonicalResearchRunID(parentRunID) || !packageID || !packageVersion) return null;
+  const draft = normalizeResearchDraft({
+    question: run.question,
+    mode: run.mode,
+    sources: run.requested_sources,
+    subjectIDs: [],
+    packageConstraint: packageID,
+    parentRunID,
+  });
+  if (!draft.question || draft.parentRunID !== parentRunID || draft.packageConstraint !== packageID) return null;
+  return {
+    draft,
+    selectedCandidateKey: researchCandidateKey({ package_id: packageID, package_version: packageVersion }),
+    suggestion,
+  };
 }
 
 function selectResearchPreflightCandidate(previousKey, candidates) {
@@ -11581,6 +11627,19 @@ function buildResearchRunRequest(draft, preflight, candidate) {
   };
 }
 
+function buildResearchPreflightRequest(draft) {
+  const normalized = normalizeResearchDraft(draft);
+  const request = {
+    mode: normalized.mode,
+    question: normalized.question,
+    requested_sources: normalized.sources,
+    subject_ids: normalized.subjectIDs,
+  };
+  if (normalized.packageConstraint) request.package_constraint = normalized.packageConstraint;
+  if (normalized.parentRunID) request.parent_run_id = normalized.parentRunID;
+  return request;
+}
+
 function prepareResearchRunSubmission(draft, state, now = Date.now()) {
   const blockReason = researchRunStartBlockReason(
     draft, state?.preflight, state?.selectedCandidateKey,
@@ -11593,6 +11652,11 @@ function prepareResearchRunSubmission(draft, state, now = Date.now()) {
 
 function clearResearchRunSubmission(state = researchState) {
   state.runSubmission = null;
+}
+
+function clearResearchLinkedRetryContext(state = researchState) {
+  state.parentRunID = "";
+  state.draft = normalizeResearchDraft({ ...state.draft, parentRunID: "" });
 }
 
 function researchPreflightErrorMessage(error) {
@@ -11617,6 +11681,7 @@ function researchPreflightErrorMessage(error) {
     "research_package_not_eligible": "当前 Agent 不支持所选研究范围。",
     "research_service_unavailable": "研究服务暂时不可用，请稍后重试。",
     "research_idempotency_conflict": "本次创建请求与已有请求冲突，请重新开始。",
+    "invalid_research_run_response": "服务器返回的研究运行 ID 无效，请重新创建。",
     "method_not_allowed": "当前操作方式不受支持。",
     "unauthorized": "当前会话已失效，请重新登录。",
   })[code] || "运行前检查未完成，请稍后重试。";
@@ -11669,19 +11734,21 @@ function researchGapLabel(value) {
 function researchRecentRunIDs() {
   try {
     const parsed = JSON.parse(window.localStorage?.getItem(researchRecentRunsKey) || "[]");
-    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string").slice(0, 12) : [];
+    return Array.isArray(parsed) ? parsed.filter(isCanonicalResearchRunID).slice(0, 12) : [];
   } catch {
     return [];
   }
 }
 
 function rememberResearchRun(runID) {
-  const unique = [...new Set([String(runID || ""), ...researchRecentRunIDs()].filter(Boolean))].slice(0, 12);
+  if (!isCanonicalResearchRunID(runID)) return false;
+  const unique = [...new Set([String(runID), ...researchRecentRunIDs()])].slice(0, 12);
   try {
     window.localStorage?.setItem(researchRecentRunsKey, JSON.stringify(unique));
   } catch {
     // Recent opaque run IDs are a convenience only.
   }
+  return true;
 }
 
 function clearResearchRunDetail(nextRunID = "") {
@@ -11690,6 +11757,7 @@ function clearResearchRunDetail(nextRunID = "") {
   if (researchEventPollTimer) clearTimeout(researchEventPollTimer);
   researchEventPollTimer = null;
   researchState.detail = nextRunID ? { run: { run_id: nextRunID } } : null;
+  researchState.detailOwnerVisible = false;
   researchState.events = [];
   researchState.nextSequence = 0;
   researchState.message = "";
@@ -11811,6 +11879,7 @@ function renderResearchWorkspace(route = getResearchRoute()) {
   const tabs = [["evidence", "证据"], ["timeline", "时间线"], ["conflicts", "冲突"], ["report", "研究报告"]];
   const identities = Array.isArray(detail.identity_bindings) ? detail.identity_bindings : [];
   const failure = run?.failure ? researchFailurePresentation(run.failure) : null;
+  const linkedRetry = researchLinkedRetryPlan(detail, researchState.detailOwnerVisible);
   const sourceChoices = [["knowledge", "知识库"], ["chatlog", "本地聊天记录"], ["prior_runs", "历史研究"]];
   const modeChoices = [["quick", "快速检索"], ["auto", "自动判断"], ["deep", "深度研究"]];
   renderShell(`<main class="research-workspace">
@@ -11818,7 +11887,7 @@ function renderResearchWorkspace(route = getResearchRoute()) {
     <form class="research-launchpad" id="research-create-form" aria-label="发起研究" novalidate>
       <section class="research-launchpad__draft" aria-labelledby="research-draft-title"><header><span>01 / 定义研究</span><h2 id="research-draft-title">问题与范围</h2><p>问题停笔约 600ms 后，系统自动匹配 Agent；不会把问题写入网址或浏览器存储。</p></header>
         <div class="research-launchpad__draft-grid">
-          <label class="research-launchpad__question"><span>研究问题</span><textarea name="question" rows="3" required placeholder="例如：比较当前建议与去年同类案例，有哪些适用差异？">${escapeHTML(researchState.draft.question)}</textarea></label>
+          <label class="research-launchpad__question" for="research-question"><span>研究问题</span><textarea id="research-question" name="question" rows="3" required placeholder="例如：比较当前建议与去年同类案例，有哪些适用差异？">${escapeHTML(researchState.draft.question)}</textarea></label>
           <fieldset><legend>模式</legend>${modeChoices.map(([value, label]) => `<label><input type="radio" name="mode" value="${value}" ${researchState.draft.mode === value ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
           <fieldset><legend>来源</legend>${sourceChoices.map(([value, label]) => `<label><input type="checkbox" name="sources" value="${value}" ${researchState.draft.sources.includes(value) ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
         </div>
@@ -11830,7 +11899,7 @@ function renderResearchWorkspace(route = getResearchRoute()) {
       <aside class="research-stage-rail" aria-label="研究阶段"><header><span>RUN</span><strong>${escapeHTML(researchStatusLabel(run?.status))}</strong></header><ol>${researchStages.map(([status, label], index) => `<li class="${run?.status === status ? "is-current" : index < currentStage || researchTerminalStatuses.has(run?.status) ? "is-done" : ""}"><span>${String(index + 1).padStart(2, "0")}</span><div><strong>${label}</strong><small>${run?.status === status ? "当前阶段" : index < currentStage ? "已完成" : "等待"}</small></div></li>`).join("")}</ol></aside>
       <section class="research-dossier__center"><header class="research-run-header"><div><span>${escapeHTML(run?.mode === "deep" ? "深度研究" : "快速检索")}</span><h2>${escapeHTML(run?.question || "正在读取研究问题…")}</h2></div>${active ? `<button class="button button-ghost" data-research-cancel ${researchState.loading.cancel ? "disabled" : ""}>取消运行</button>` : `<a class="button button-ghost" href="${ROUTES.research}">新建研究</a>`}</header>
         ${identities.length ? `<section class="research-identities"><header><span>身份边界</span><strong>需要人工确认</strong></header>${identities.map((item, index) => `<article><div><strong>候选 ${index + 1}</strong><span>${escapeHTML(item.source_type || "来源待核")} · 置信度 ${Math.round(Number(item.confidence || 0) * 100)}%</span></div><button class="button button-ghost" data-research-confirm-identity="${escapeAttribute(item.binding_id)}" ${item.confirmed ? "disabled" : ""}>${item.confirmed ? "已确认" : "确认身份"}</button></article>`).join("")}</section>` : ""}
-        ${failure ? `<section class="research-failure" role="alert"><span>${escapeHTML(run.failure.code || "failed")}</span><h3>${escapeHTML(failure[0])}</h3><p>${escapeHTML(failure[1])}</p><a class="button button-primary" href="${ROUTES.research}">调整范围并重试</a></section>` : ""}
+        ${failure ? `<section class="research-failure" role="alert"><span>${escapeHTML(run.failure.code || "failed")}</span><h3>${escapeHTML(failure[0])}</h3><p>${escapeHTML(failure[1])}</p>${linkedRetry ? `<div class="research-failure__retry"><strong>下一步建议</strong><p>${escapeHTML(linkedRetry.suggestion)}</p><button class="button button-primary" type="button" data-research-linked-retry>调整并重试</button></div>` : ""}</section>` : ""}
         <nav class="research-tablist" role="tablist" aria-label="研究案卷视图">${tabs.map(([value, label]) => `<button type="button" role="tab" aria-selected="${researchState.activeTab === value}" data-research-tab="${value}">${label}</button>`).join("")}</nav>
         <section class="research-tabpanel" role="tabpanel">${renderResearchTabPanel(detail, researchState.activeTab)}</section></section>
       <aside class="research-scope-ledger"><section><span>检索范围</span><ul>${researchScopeItems(run?.actual_scope?.searched_sources)}</ul></section><section><span>引用范围</span><ul>${researchScopeItems(run?.actual_scope?.cited_sources)}</ul></section><section class="research-event-ledger"><span>阶段记录</span>${researchState.events.length ? `<ol>${researchState.events.slice(-8).reverse().map((event) => `<li><time>${escapeHTML(event.created_at || "")}</time><p>${escapeHTML(researchEventLabel(event.code))}</p></li>`).join("")}</ol>` : `<p>等待第一条阶段记录。</p>`}</section></aside>
@@ -11869,6 +11938,37 @@ function bindResearchWorkspaceEvents(route) {
   document.querySelector("[data-research-cancel]")?.addEventListener("click", () => cancelResearchRun(route?.runID));
   document.querySelectorAll("[data-research-tab]").forEach((button) => button.addEventListener("click", () => { researchState.activeTab = button.dataset.researchTab || "evidence"; renderResearchWorkspace(route); }));
   document.querySelectorAll("[data-research-confirm-identity]").forEach((button) => button.addEventListener("click", () => confirmResearchIdentity(route?.runID, button.dataset.researchConfirmIdentity)));
+  document.querySelector("[data-research-linked-retry]")?.addEventListener("click", startResearchLinkedRetry);
+}
+
+function focusResearchLinkedDraft(expectedParentRunID) {
+  if (!isCanonicalResearchRunID(expectedParentRunID)) return false;
+  const route = getResearchRoute();
+  if (!route || route.runID || route.packageID || route.packageVersion) return false;
+  if (researchState.parentRunID !== expectedParentRunID || researchState.draft.parentRunID !== expectedParentRunID) return false;
+  const question = document.querySelector("#research-question");
+  if (!question) return false;
+  question.focus({ preventScroll: true });
+  return true;
+}
+
+function startResearchLinkedRetry() {
+  const route = getResearchRoute();
+  const plan = researchLinkedRetryPlan(researchState.detail, researchState.detailOwnerVisible);
+  if (!route?.runID || route.runID !== researchState.detail?.run?.run_id || !plan) return false;
+  cancelResearchPreflightLifecycle(true);
+  clearResearchRunDetail();
+  researchState.parentRunID = plan.draft.parentRunID;
+  researchState.draft = plan.draft;
+  researchState.selectedCandidateKey = plan.selectedCandidateKey;
+  researchState.error = "";
+  researchState.message = "已继承原案卷的公开范围；将创建新的关联研究，原案卷保持不变。";
+  window.history.pushState({}, "", ROUTES.research);
+  renderResearchWorkspace({ runID: "" });
+  focusResearchLinkedDraft(plan.draft.parentRunID);
+  scheduleResearchPreflight(researchState.draft, 0);
+  void loadRecentResearchRuns({ focusParentRunID: plan.draft.parentRunID });
+  return true;
 }
 
 function researchDraftFromForm(form) {
@@ -11967,14 +12067,7 @@ async function requestResearchPreflight(draft) {
   researchState.loading.preflight = true;
   researchState.error = "";
   renderResearchWorkspacePreservingDraftFocus({ runID: "" });
-  const preflightRequest = {
-    mode: normalized.mode,
-    question: normalized.question,
-    requested_sources: normalized.sources,
-    subject_ids: normalized.subjectIDs,
-  };
-  if (normalized.packageConstraint) preflightRequest.package_constraint = normalized.packageConstraint;
-  if (normalized.parentRunID) preflightRequest.parent_run_id = normalized.parentRunID;
+  const preflightRequest = buildResearchPreflightRequest(normalized);
   try {
     const payload = await apiFetch("/api/research/preflight", { method: "POST", signal: request.signal, body: JSON.stringify(preflightRequest) });
     if (!applyResearchPreflightResponse(researchState, researchPreflightRequestController, request, payload, researchState.draft)) return;
@@ -11995,6 +12088,16 @@ async function requestResearchPreflight(draft) {
 
 function researchRequestID() {
   return window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function isCanonicalResearchRunID(value) {
+  if (typeof value !== "string") return false;
+  const runID = value;
+  return runID.length > 0 && Array.from(runID).length <= 128 && /^[A-Za-z0-9_-]+$/.test(runID);
+}
+
+function researchDetailRequestOptions(signal) {
+  return { signal, cache: "no-store" };
 }
 
 function researchRunSubmissionFingerprint(payload) {
@@ -12050,7 +12153,9 @@ async function createResearchRun(event) {
     const payload = await postResearchRunSubmission(submission.payload);
     const runID = payload?.run?.run_id;
     if (!runID) throw new Error("服务器未返回研究运行 ID");
+    if (!isCanonicalResearchRunID(runID)) throw new Error("invalid_research_run_response");
     clearResearchRunSubmission(researchState);
+    clearResearchLinkedRetryContext(researchState);
     rememberResearchRun(runID);
     window.history.pushState({}, "", buildResearchRunURL(runID));
     clearResearchRunDetail(runID);
@@ -12070,15 +12175,17 @@ async function createResearchRun(event) {
   }
 }
 
-async function loadRecentResearchRuns() {
+async function loadRecentResearchRuns(options) {
+  const focusParentRunID = options?.focusParentRunID;
   const request = researchListRequestController.begin();
   researchState.loading.list = true;
   renderResearchWorkspace({ runID: "" });
+  focusResearchLinkedDraft(focusParentRunID);
   const runs = [];
   for (const runID of researchRecentRunIDs()) {
     try {
-      const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}`, { signal: request.signal });
-      if (payload?.run) runs.push(payload.run);
+      const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}`, researchDetailRequestOptions(request.signal));
+      if (payload?.run?.run_id === runID) runs.push(payload.run);
     } catch (error) {
       if (error?.name === "AbortError") return;
     }
@@ -12087,18 +12194,34 @@ async function loadRecentResearchRuns() {
   researchState.recentRuns = runs;
   researchState.loading.list = false;
   renderResearchWorkspace({ runID: "" });
+  focusResearchLinkedDraft(focusParentRunID);
 }
 
 async function loadResearchRun(runID) {
+  researchState.detailOwnerVisible = false;
+  if (!isCanonicalResearchRunID(runID)) {
+    researchDetailRequestController.cancel();
+    researchState.loading.detail = false;
+    researchState.message = "研究运行 ID 无效，请从最近案卷重新打开。";
+    renderResearchWorkspace({ runID });
+    return;
+  }
   const request = researchDetailRequestController.begin();
   researchState.loading.detail = true;
+  renderResearchWorkspace({ runID });
   try {
-    const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}`, { signal: request.signal });
+    const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}`, researchDetailRequestOptions(request.signal));
     if (!researchDetailRequestController.isCurrent(request.sequence) || getResearchRoute()?.runID !== runID) return;
+    if (!isCanonicalResearchRunID(runID) || payload?.run?.run_id !== runID) {
+      researchState.message = "研究案卷响应与当前地址不一致，请重新打开案卷。";
+      return;
+    }
     researchState.detail = payload;
+    researchState.detailOwnerVisible = true;
     rememberResearchRun(runID);
   } catch (error) {
     if (error?.name === "AbortError" || !researchDetailRequestController.isCurrent(request.sequence)) return;
+    researchState.detailOwnerVisible = false;
     researchState.message = error instanceof Error ? error.message : String(error);
   } finally {
     if (researchDetailRequestController.isCurrent(request.sequence) && getResearchRoute()?.runID === runID) {
@@ -12193,7 +12316,8 @@ async function boot() {
     researchListRequestController.cancel();
     cancelResearchPreflightLifecycle(true);
     clearResearchRunDetail();
-	}
+    clearResearchLinkedRetryContext(researchState);
+  }
   if (!routePathname.startsWith(`${ROUTES.knowledgeCollections}/`)) {
     collectionWorkspaceLoadSequence += 1;
   }
@@ -12242,6 +12366,7 @@ async function boot() {
   }
   if (researchRoute) {
     if (researchRoute.runID) {
+      clearResearchLinkedRetryContext(researchState);
       cancelResearchPreflightLifecycle(true);
       if (researchState.detail?.run?.run_id !== researchRoute.runID) clearResearchRunDetail(researchRoute.runID);
       renderResearchWorkspace(researchRoute);

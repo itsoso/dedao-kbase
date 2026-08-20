@@ -2752,6 +2752,77 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	}
 }
 
+func TestKBaseHTTPResearchRunLinkedRetryInheritsParentFromPreflightSnapshotAndKeepsParentImmutable(t *testing.T) {
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(
+		t, knowledge, "http-linked-retry-agent", "release-http-linked-retry", "citation-http-linked-retry",
+		"generic linked retry evidence", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, nil))
+
+	createRun := func(question, parentRunID, idempotencyKey string) ResearchRun {
+		t.Helper()
+		preflightBody := fmt.Sprintf(`{"mode":"quick","question":%q,"requested_sources":["knowledge"],"package_constraint":%q`, question, pkg.PackageID)
+		if parentRunID != "" {
+			preflightBody += fmt.Sprintf(`,"parent_run_id":%q`, parentRunID)
+		}
+		preflightBody += `}`
+		preflightResponse := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret", preflightBody)
+		if preflightResponse.Code != http.StatusCreated {
+			t.Fatalf("preflight status=%d body=%s", preflightResponse.Code, preflightResponse.Body.String())
+		}
+		var preflight PublicResearchPreflightResult
+		if err := json.Unmarshal(preflightResponse.Body.Bytes(), &preflight); err != nil {
+			t.Fatal(err)
+		}
+		if preflight.ParentRunID != parentRunID {
+			t.Fatalf("preflight parent=%q want=%q", preflight.ParentRunID, parentRunID)
+		}
+		runBody := fmt.Sprintf(`{"preflight_id":%q,"mode":"quick","question":%q,"package_id":%q,"package_version":%q,"requested_sources":["knowledge"]}`,
+			preflight.PreflightID, question, pkg.PackageID, pkg.Version)
+		request := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(runBody))
+		request.Header.Set("Authorization", "Bearer admin-secret")
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("run status=%d body=%s", response.Code, response.Body.String())
+		}
+		var payload struct {
+			Run ResearchRun `json:"run"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.Run
+	}
+
+	parent := createRun("generic linked retry evidence parent", "", "http-linked-parent")
+	parentBefore, err := research.LoadRun(parent.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := createRun("generic linked retry evidence child", parent.RunID, "http-linked-child")
+	if child.ParentRunID != parent.RunID || child.RunID == parent.RunID {
+		t.Fatalf("child links=%#v parent=%#v", child, parent)
+	}
+	parentAfter, err := research.LoadRun(parent.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(parentAfter, parentBefore) {
+		t.Fatalf("linked retry mutated parent: before=%#v after=%#v", parentBefore, parentAfter)
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(child.RunID), "admin-secret")
+	if detail.Code != http.StatusAccepted || !strings.Contains(detail.Body.String(), `"parent_run_id":"`+parent.RunID+`"`) {
+		t.Fatalf("child detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	assertResearchRunCount(t, research, 2)
+}
+
 func TestKBaseHTTPResearchRunRequiresPreflightForBearerAndBrowser(t *testing.T) {
 	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
 	knowledge := NewBookKnowledgeStore(t.TempDir())
