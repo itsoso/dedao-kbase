@@ -68,14 +68,11 @@ func (s *ResearchPreflightService) Evaluate(
 	if s.Now != nil {
 		now = s.Now().UTC()
 	}
-	resolvedMode, _, err := RouteResearchMode(ResearchRunRequest{
+	resolvedMode, _ := routeValidatedResearchMode(ResearchRunRequest{
 		Mode: normalized.Mode, Question: normalized.Question,
 		PackageID: "preflight", PackageVersion: "1",
 		RequestedSources: normalized.RequestedSources,
 	})
-	if err != nil {
-		return nil, err
-	}
 
 	workerObserved, workerRankState, err := s.workerReadiness(normalized, now)
 	if err != nil {
@@ -397,7 +394,7 @@ func (s *ResearchPreflightService) workerReadiness(
 		return SourceAgentObservedOffline, SourceAgentObservedOffline, nil
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("%w: Worker state unavailable", ErrResearchPreflightUnavailable)
+		return "", "", fmt.Errorf("%w: Worker state unavailable: %w", ErrResearchPreflightUnavailable, err)
 	}
 	observed := DeriveSourceAgentObservedState(
 		agent, now, researchPreflightWorkerFreshness, false,

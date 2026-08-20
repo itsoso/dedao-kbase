@@ -4904,7 +4904,9 @@ func (h *kbaseHTTPHandler) revalidateResearchRunSelection(
 	}
 	if err != nil {
 		if researchPreflightDependencyRetryable(err) {
-			return ResearchPreflightCandidate{}, ErrResearchPreflightUnavailable
+			return ResearchPreflightCandidate{}, fmt.Errorf(
+				"%w: Package revalidation unavailable: %w", ErrResearchPreflightUnavailable, err,
+			)
 		}
 		return ResearchPreflightCandidate{}, ErrResearchPreflightPackageChanged
 	}

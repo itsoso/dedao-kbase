@@ -66,7 +66,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 6507,
+      "line": 6509,
       "authenticated": true
     },
     {
@@ -222,13 +222,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 6621,
+      "line": 6623,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 6623,
+      "line": 6625,
       "authenticated": true
     },
     {
@@ -792,7 +792,7 @@
     {
       "path": "/api/research-worker/jobs/",
       "file": "backend/app/kbase_http.go",
-      "line": 5381,
+      "line": 5383,
       "authenticated": true
     },
     {
@@ -804,7 +804,7 @@
     {
       "path": "/api/research-worker/jobs/claim",
       "file": "backend/app/kbase_http.go",
-      "line": 5300,
+      "line": 5302,
       "authenticated": true
     },
     {
@@ -960,7 +960,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 5810,
+      "line": 5812,
       "authenticated": true
     },
     {

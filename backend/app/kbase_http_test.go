@@ -2951,6 +2951,57 @@ func TestKBaseHTTPResearchRunPreflightRejectsProductionGateDriftWithoutRows(t *t
 	}
 }
 
+func TestKBaseHTTPResearchRunPreflightRevalidationPreservesRetryableCause(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(
+		t, knowledge, "http-cause-agent", "release-http-cause", "citation-http-cause",
+		"generic HTTP cause evidence", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, nil)).(*kbaseHTTPHandler)
+	previous := agentPackageArtifactLoadHook
+	agentPackageArtifactLoadHook = func(context.Context, string) error {
+		return &os.PathError{Op: "read", Path: "/private/retryable-package", Err: os.ErrPermission}
+	}
+	t.Cleanup(func() { agentPackageArtifactLoadHook = previous })
+
+	_, err := handler.revalidateResearchRunSelection(context.Background(), ResearchRunRequest{
+		PreflightID: "research-preflight-cause", Mode: ResearchModeQuick,
+		Question: "generic HTTP cause evidence", PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		RequestedSources: []string{ResearchSourceKnowledge},
+	}, ResearchModeQuick)
+	if !errors.Is(err, ErrResearchPreflightUnavailable) || !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("revalidation error=%v", err)
+	}
+}
+
+func TestKBaseHTTPResearchPreflightWorkerUnavailableStaysRedacted(t *testing.T) {
+	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	pkg := publishResearchPreflightServicePackage(
+		t, knowledge, "http-worker-cause-agent", "release-http-worker-cause", "citation-http-worker-cause",
+		"generic HTTP Worker cause evidence", now, nil,
+	)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	source := openResearchPreflightSourceStore(t, now)
+	if _, err := source.db.Exec(`DROP TABLE source_agents`); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, source))
+	response := requestJSONKBase(handler, http.MethodPost, "/api/research/preflight", "admin-secret",
+		fmt.Sprintf(`{"mode":"deep","question":"generic HTTP Worker cause evidence","requested_sources":["chatlog"],"package_constraint":%q}`, pkg.PackageID))
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"error\":\"research_preflight_unavailable\"}\n" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, private := range []string{"source_agents", "no such table", source.DBPath(), knowledge.Root()} {
+		if private != "" && strings.Contains(response.Body.String(), private) {
+			t.Fatalf("Worker error leaked %q: %s", private, response.Body.String())
+		}
+	}
+	assertResearchRunCount(t, research, 0)
+}
+
 func TestKBaseHTTPResearchRunPreflightRejectsBlockedSnapshotWithoutRows(t *testing.T) {
 	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
 	knowledge := NewBookKnowledgeStore(t.TempDir())

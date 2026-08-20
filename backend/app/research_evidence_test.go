@@ -159,10 +159,7 @@ func TestResearchEvidenceStoreEnforcesRunItemAndQuotedCharacterBudgetsAtomically
 	input := researchStoreTestInput("evidence-budget")
 	input.Budget.MaxEvidenceItems = 1
 	input.Budget.MaxQuotedChars = 10
-	run, _, err := store.CreateRun(input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	run := insertResearchRunFixtureForTest(t, store, input)
 	first := researchEvidenceTestCandidate("123456")
 	firstBundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
 		SearchedSources: []string{ResearchSourceChatlog}, Items: []ResearchWorkerEvidenceCandidate{first},
@@ -193,10 +190,7 @@ func TestResearchEvidenceStoreEnforcesRunItemAndQuotedCharacterBudgetsAtomically
 	input = researchStoreTestInput("quoted-budget")
 	input.Budget.MaxEvidenceItems = 5
 	input.Budget.MaxQuotedChars = 10
-	quotedRun, _, err := store.CreateRun(input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	quotedRun := insertResearchRunFixtureForTest(t, store, input)
 	if _, err := store.StoreEvidenceBundle(quotedRun.RunID, quotedRun.Version, ResearchEvidenceBundle{
 		Evidence:        append(append([]ResearchEvidence{}, firstBundle.Evidence...), secondBundle.Evidence...),
 		SearchedSources: []string{ResearchSourceChatlog}, CitedSources: []string{ResearchSourceChatlog},

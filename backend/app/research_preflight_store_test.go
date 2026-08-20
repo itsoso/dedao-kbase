@@ -111,6 +111,7 @@ func TestResearchPreflightStoreMigrationContainsNoRawQuestionColumns(t *testing.
 
 func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(t *testing.T) {
 	root := t.TempDir()
+	now := time.Date(2026, 8, 19, 12, 5, 0, 0, time.UTC)
 	db, err := sql.Open("sqlite3", filepath.Join(root, researchStoreDBName))
 	if err != nil {
 		t.Fatal(err)
@@ -124,15 +125,79 @@ func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(
 		budget_json TEXT NOT NULL DEFAULT '{}', wait_reason TEXT NOT NULL DEFAULT '', failure_json TEXT NOT NULL DEFAULT '',
 		version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
 		lease_owner TEXT NOT NULL DEFAULT '', lease_epoch TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT ''
+	);
+	CREATE TABLE research_preflights (
+		preflight_id TEXT PRIMARY KEY, owner_hash TEXT NOT NULL, request_hash TEXT NOT NULL,
+		status TEXT NOT NULL, candidates_json TEXT NOT NULL, checks_json TEXT NOT NULL,
+		gaps_json TEXT NOT NULL, parent_run_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL
 	)`)
 	if err != nil {
+		t.Fatal(err)
+	}
+	legacyInput := researchStoreTestInput("legacy-migrated-run")
+	legacyInput.Request.PreflightID = ""
+	legacyHash, err := hashResearchRunInput(legacyInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRun := ResearchRun{
+		SchemaVersion: ResearchRunSchemaVersion, RunID: "research-run-legacy-migrated",
+		Mode: ResearchModeQuick, Question: "legacy migrated question", Status: ResearchPlanning,
+		PackageID: "package-fixture", PackageVersion: "1.0.0",
+		RequestedSources: []string{ResearchSourceKnowledge}, RouteReasons: []string{ResearchRouteExplicitQuick},
+		Budget: legacyInput.Budget, Version: 1,
+		CreatedAt: "2026-08-19T12:00:00Z", UpdatedAt: "2026-08-19T12:00:00Z",
+	}
+	legacyValues, err := marshalResearchRunValues(&legacyRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO research_runs (
+		run_id, idempotency_key, request_hash, schema_version, mode, question, status,
+		package_id, package_version, subject_ids_json, requested_sources_json, route_reasons_json,
+		actual_scope_json, budget_json, wait_reason, failure_json, version, created_at, updated_at,
+		lease_owner, lease_epoch, lease_expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		legacyRun.RunID, legacyInput.IdempotencyKey, legacyHash, legacyRun.SchemaVersion, legacyRun.Mode,
+		legacyRun.Question, legacyRun.Status, legacyRun.PackageID, legacyRun.PackageVersion,
+		legacyValues.subjectIDs, legacyValues.requestedSources, legacyValues.routeReasons,
+		legacyValues.actualScope, legacyValues.budget, legacyRun.WaitReason, legacyValues.failure,
+		legacyRun.Version, legacyRun.CreatedAt, legacyRun.UpdatedAt, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	legacyRequest := ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "legacy confirmation question",
+		RequestedSources: []string{ResearchSourceKnowledge}, PackageConstraint: "candidate-a",
+	}
+	legacyPreflightHash, err := hashResearchPreflightRequest(legacyRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPreflight := testResearchPreflight()
+	legacyPreflight.PreflightID = "research-preflight-legacy-migrated"
+	legacyPreflight.RequestHash = legacyPreflightHash
+	legacyPreflight.ParentRunID = ""
+	legacyPreflight.CreatedAt = "2026-08-19T12:00:00.000000000Z"
+	legacyPreflight.ExpiresAt = "2026-08-19T12:10:00.000000000Z"
+	legacyPayload, err := encodeResearchPreflightPayload(legacyPreflight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO research_preflights (
+		preflight_id, owner_hash, request_hash, status, candidates_json, checks_json, gaps_json,
+		parent_run_id, created_at, expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
+		legacyPreflight.PreflightID, testResearchPreflightOwnerA, legacyPreflightHash,
+		legacyPreflight.Status, legacyPayload.candidatesJSON, legacyPayload.checksJSON, legacyPayload.gapsJSON,
+		legacyPreflight.CreatedAt, legacyPreflight.ExpiresAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	store, err := OpenResearchStore(root, time.Now)
+	store, err := OpenResearchStore(root, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +217,76 @@ func TestResearchRunRequiresPreflightMigrationAddsBackwardCompatibleLinkColumns(
 		if count != 1 {
 			t.Fatalf("missing %s.%s", target.table, target.column)
 		}
+	}
+	loadedRun, err := store.LoadRun(legacyRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedRun.RunID != legacyRun.RunID || loadedRun.PreflightID != "" || loadedRun.ParentRunID != "" {
+		t.Fatalf("legacy Run after migration=%#v", loadedRun)
+	}
+	loadedPreflight, err := store.LoadResearchPreflightForOwner(legacyPreflight.PreflightID, testResearchPreflightOwnerA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedPreflight.PreflightID != legacyPreflight.PreflightID || len(loadedPreflight.Candidates) != 1 {
+		t.Fatalf("legacy preflight after migration=%#v", loadedPreflight)
+	}
+	confirmation := ResearchRunConfirmation{
+		OwnerHash: testResearchPreflightOwnerA,
+		Input: ResearchRunInput{
+			IdempotencyKey: "legacy-confirmation",
+			Request: ResearchRunRequest{
+				PreflightID: legacyPreflight.PreflightID, Mode: ResearchModeQuick,
+				Question: legacyRequest.Question, PackageID: "candidate-a", PackageVersion: "1.0.0",
+				RequestedSources: legacyRequest.RequestedSources,
+			},
+			Mode: ResearchModeQuick, RouteReasons: []string{ResearchRouteExplicitQuick},
+			Budget: ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1},
+		},
+		SelectedCandidate: legacyPreflight.Candidates[0],
+	}
+	if _, _, err := store.ConfirmResearchRun(confirmation); !errors.Is(err, ErrResearchPreflightRequestChanged) {
+		t.Fatalf("legacy preflight confirmation error=%v", err)
+	}
+	assertResearchRunCount(t, store, 1)
+}
+
+func TestResearchRunRequiresPreflightMigrationEnforcesUniqueNonEmptyBinding(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(current *ResearchStore, runID, preflightID, key string) error {
+		_, err := current.db.Exec(`INSERT INTO research_runs (
+			run_id, preflight_id, idempotency_key, request_hash, schema_version, mode, question, status,
+			version, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			runID, preflightID, key, "sha256:"+strings.Repeat("a", 64), ResearchRunSchemaVersion,
+			ResearchModeQuick, "migration fixture", ResearchPlanning, 1,
+			"2026-08-19T12:00:00Z", "2026-08-19T12:00:00Z")
+		return err
+	}
+	if err := insert(store, "research-run-legacy-a", "", "legacy-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := insert(store, "research-run-bound-a", "research-preflight-unique", "bound-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if err := insert(reopened, "research-run-legacy-b", "", "legacy-b"); err != nil {
+		t.Fatalf("legacy empty preflight rows must remain compatible after reopen: %v", err)
+	}
+	if err := insert(reopened, "research-run-bound-b", "research-preflight-unique", "bound-b"); err == nil {
+		t.Fatal("one non-empty preflight_id was bound to multiple Research Runs")
 	}
 }
 

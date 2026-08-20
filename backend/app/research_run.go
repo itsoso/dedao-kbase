@@ -56,7 +56,7 @@ const (
 )
 
 type ResearchRunRequest struct {
-	PreflightID      string   `json:"preflight_id,omitempty"`
+	PreflightID      string   `json:"preflight_id"`
 	Mode             string   `json:"mode"`
 	Question         string   `json:"question"`
 	PackageID        string   `json:"package_id,omitempty"`
@@ -129,11 +129,12 @@ type ResearchTransition struct {
 
 func ValidateResearchRunRequest(request ResearchRunRequest) error {
 	preflightID := strings.TrimSpace(request.PreflightID)
-	if preflightID != "" {
-		if len([]rune(preflightID)) > researchPreflightIDMaxRunes ||
-			!validResearchPreflightResourceID(preflightID) || preflightID != request.PreflightID {
-			return fmt.Errorf("preflight_id must be a canonical bounded Research resource ID")
-		}
+	if preflightID == "" {
+		return ErrResearchPreflightRequired
+	}
+	if len([]rune(preflightID)) > researchPreflightIDMaxRunes ||
+		!validResearchPreflightResourceID(preflightID) || preflightID != request.PreflightID {
+		return fmt.Errorf("preflight_id must be a canonical bounded Research resource ID")
 	}
 	mode := strings.TrimSpace(request.Mode)
 	if mode == "" {
@@ -186,21 +187,26 @@ func RouteResearchMode(request ResearchRunRequest) (string, []string, error) {
 	if err := ValidateResearchRunRequest(request); err != nil {
 		return "", nil, err
 	}
+	mode, reasons := routeValidatedResearchMode(request)
+	return mode, reasons, nil
+}
+
+func routeValidatedResearchMode(request ResearchRunRequest) (string, []string) {
 	mode := strings.TrimSpace(request.Mode)
 	if mode == "" {
 		mode = ResearchModeAuto
 	}
 	switch mode {
 	case ResearchModeQuick:
-		return ResearchModeQuick, []string{ResearchRouteExplicitQuick}, nil
+		return ResearchModeQuick, []string{ResearchRouteExplicitQuick}
 	case ResearchModeDeep:
-		return ResearchModeDeep, []string{ResearchRouteExplicitDeep}, nil
+		return ResearchModeDeep, []string{ResearchRouteExplicitDeep}
 	}
 	reasons := researchDeepRouteReasons(request)
 	if len(reasons) > 0 {
-		return ResearchModeDeep, reasons, nil
+		return ResearchModeDeep, reasons
 	}
-	return ResearchModeQuick, []string{ResearchRouteBoundedKnowledge}, nil
+	return ResearchModeQuick, []string{ResearchRouteBoundedKnowledge}
 }
 
 func ValidateResearchModeScope(request ResearchRunRequest, resolvedMode string) error {

@@ -361,10 +361,7 @@ func TestResearchOrchestratorQuickPathBoundsEvidenceBeforeModelCostReservation(t
 	input.Budget = ResearchBudget{
 		MaxIterations: 2, MaxEvidenceItems: 40, MaxQuotedChars: 12000, MaxModelCalls: 4, MaxCostUSD: 1,
 	}
-	run, _, err := research.CreateRun(input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	run := insertResearchRunFixtureForTest(t, research, input)
 	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 12)
 	evidence, err := research.ListEvidence(run.RunID)
 	if err != nil {
@@ -390,10 +387,7 @@ func TestResearchOrchestratorQuickPathBoundsDraftsBeforeVerifierCostReservation(
 	input.Request.PackageVersion = pkg.Version
 	input.Request.Question = "grounded"
 	input.Budget.MaxCostUSD = 1
-	run, _, err := research.CreateRun(input)
-	if err != nil {
-		t.Fatal(err)
-	}
+	run := insertResearchRunFixtureForTest(t, research, input)
 
 	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 12)
 	drafts, err := orchestrator.loadDrafts(run.RunID)
@@ -1943,11 +1937,7 @@ func createResearchOrchestratorRun(t *testing.T, store *ResearchStore, pkg Agent
 	if mode == ResearchModeDeep {
 		input.RouteReasons = []string{ResearchRouteExplicitDeep}
 	}
-	run, _, err := store.CreateRun(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return *run
+	return insertResearchRunFixtureForTest(t, store, input)
 }
 
 func advanceResearchUntilTerminal(t *testing.T, orchestrator *ResearchOrchestrator, runID string, limit int) ResearchAdvanceResult {

@@ -395,9 +395,5 @@ func createResearchToolRun(t *testing.T, store *ResearchStore, pkg AgentPackage,
 	input.Request.RequestedSources = []string{ResearchSourceKnowledge, ResearchSourceChatlog, ResearchSourcePriorRuns}
 	input.Mode = ResearchModeDeep
 	input.RouteReasons = []string{ResearchRouteExplicitDeep}
-	run, _, err := store.CreateRun(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return *run
+	return insertResearchRunFixtureForTest(t, store, input)
 }

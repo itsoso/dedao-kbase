@@ -289,7 +289,12 @@ func migrateResearchStore(db *sql.DB) error {
 	if err := ensureResearchStoreColumn(db, "research_model_invocations", "lease_epoch", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
-	return ensureResearchStoreColumn(db, "research_model_invocations", "failure_code", `TEXT NOT NULL DEFAULT ''`)
+	if err := ensureResearchStoreColumn(db, "research_model_invocations", "failure_code", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_research_runs_preflight_binding
+		ON research_runs(preflight_id) WHERE preflight_id <> ''`)
+	return err
 }
 
 func ensureResearchStoreColumn(db *sql.DB, table, column, definition string) error {
@@ -319,70 +324,6 @@ func ensureResearchStoreColumn(db *sql.DB, table, column, definition string) err
 	}
 	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
 	return err
-}
-
-func (s *ResearchStore) CreateRun(input ResearchRunInput) (*ResearchRun, bool, error) {
-	if err := validateResearchRunInput(input); err != nil {
-		return nil, false, err
-	}
-	requestHash, err := hashResearchRunInput(input)
-	if err != nil {
-		return nil, false, err
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, false, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var existingID, existingHash string
-	err = tx.QueryRow(`SELECT run_id, request_hash FROM research_runs WHERE idempotency_key = ?`, input.IdempotencyKey).Scan(&existingID, &existingHash)
-	if err == nil {
-		if existingHash != requestHash {
-			return nil, false, ErrResearchRunIdempotencyConflict
-		}
-		run, err := loadResearchRun(tx, existingID)
-		return run, false, err
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, false, err
-	}
-
-	now := s.now().UTC().Format(time.RFC3339Nano)
-	run := &ResearchRun{
-		SchemaVersion: ResearchRunSchemaVersion, RunID: newResearchRunID(), Mode: input.Mode,
-		PreflightID: strings.TrimSpace(input.Request.PreflightID),
-		Question:    strings.TrimSpace(input.Request.Question), Status: ResearchPlanning,
-		PackageID: strings.TrimSpace(input.Request.PackageID), PackageVersion: strings.TrimSpace(input.Request.PackageVersion),
-		SubjectIDs:       append([]string(nil), input.Request.SubjectIDs...),
-		RequestedSources: append([]string(nil), input.Request.RequestedSources...),
-		RouteReasons:     append([]string(nil), input.RouteReasons...), Budget: input.Budget,
-		Version: 1, CreatedAt: now, UpdatedAt: now,
-	}
-	values, err := marshalResearchRunValues(run)
-	if err != nil {
-		return nil, false, err
-	}
-	_, err = tx.Exec(`INSERT INTO research_runs (
-		run_id, parent_run_id, preflight_id, idempotency_key, request_hash, schema_version, mode, question, status,
-		package_id, package_version, subject_ids_json, requested_sources_json, route_reasons_json,
-		actual_scope_json, budget_json, wait_reason, failure_json, version, created_at, updated_at,
-		lease_owner, lease_epoch, lease_expires_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		run.RunID, run.ParentRunID, run.PreflightID, input.IdempotencyKey, requestHash, run.SchemaVersion, run.Mode, run.Question, run.Status,
-		run.PackageID, run.PackageVersion, values.subjectIDs, values.requestedSources, values.routeReasons,
-		values.actualScope, values.budget, run.WaitReason, values.failure, run.Version, run.CreatedAt, run.UpdatedAt,
-		run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt)
-	if err != nil {
-		return nil, false, err
-	}
-	if err := insertResearchEvent(tx, run.RunID, "", run.Status, ResearchTransition{Code: "run_created", Actor: "orchestrator"}, now); err != nil {
-		return nil, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, false, err
-	}
-	return run, true, nil
 }
 
 func (s *ResearchStore) LoadRun(runID string) (*ResearchRun, error) {

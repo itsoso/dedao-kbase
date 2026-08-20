@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 func TestResearchPreflightServiceRanksRealEvidenceAndRedactsBodies(t *testing.T) {
@@ -460,6 +462,26 @@ func TestResearchPreflightServiceNoEligiblePackageGuidesAgentCompletion(t *testi
 	}
 	if result.PreflightID == "" || result.ExpiresAt == "" {
 		t.Fatalf("blocked preflight was not persisted: %#v", result)
+	}
+}
+
+func TestResearchPreflightWorkerReadinessPreservesUnavailableCause(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	source := openResearchPreflightSourceStore(t, now)
+	if _, err := source.db.Exec(`DROP TABLE source_agents`); err != nil {
+		t.Fatal(err)
+	}
+	_, cause := source.GetSourceAgent("chatlog-agent")
+	var sqliteCause sqlite3.Error
+	if !errors.As(cause, &sqliteCause) {
+		t.Fatalf("SourceSync cause=%T %v", cause, cause)
+	}
+	service := &ResearchPreflightService{SourceSync: source}
+	_, _, err := service.workerReadiness(ResearchPreflightRequest{
+		RequestedSources: []string{ResearchSourceChatlog},
+	}, now)
+	if !errors.Is(err, ErrResearchPreflightUnavailable) || !errors.Is(err, cause) {
+		t.Fatalf("worker readiness error=%v", err)
 	}
 }
 

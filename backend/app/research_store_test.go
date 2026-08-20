@@ -1,8 +1,11 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,10 +30,7 @@ func TestResearchStoreCreatesSchemaAndPersistsRunAcrossReopen(t *testing.T) {
 		}
 	}
 
-	run, created, err := store.CreateRun(researchStoreTestInput("request-one"))
-	if err != nil || !created {
-		t.Fatalf("run=%#v created=%v err=%v", run, created, err)
-	}
+	run := insertResearchRunFixtureForTest(t, store, researchStoreTestInput("request-one"))
 	if run.SchemaVersion != ResearchRunSchemaVersion || run.Status != ResearchPlanning || run.Version != 1 {
 		t.Fatalf("run=%#v", run)
 	}
@@ -79,26 +79,6 @@ func TestResearchStoreMigrationAddsModelInvocationFailureCode(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("research_model_invocations.failure_code is missing")
-	}
-}
-
-func TestResearchStoreCreatesRunIdempotentlyAndRejectsPayloadConflict(t *testing.T) {
-	store := newResearchStoreForTest(t)
-	input := researchStoreTestInput("same-request")
-
-	first, created, err := store.CreateRun(input)
-	if err != nil || !created {
-		t.Fatalf("first=%#v created=%v err=%v", first, created, err)
-	}
-	second, created, err := store.CreateRun(input)
-	if err != nil || created || second.RunID != first.RunID {
-		t.Fatalf("second=%#v created=%v err=%v", second, created, err)
-	}
-
-	conflict := input
-	conflict.Request.Question = "A different question"
-	if _, _, err := store.CreateRun(conflict); !errors.Is(err, ErrResearchRunIdempotencyConflict) {
-		t.Fatalf("conflict error=%v", err)
 	}
 }
 
@@ -221,18 +201,16 @@ func newResearchStoreForTest(t *testing.T) *ResearchStore {
 
 func createResearchRunForTest(t *testing.T, store *ResearchStore, key string) ResearchRun {
 	t.Helper()
-	run, created, err := store.CreateRun(researchStoreTestInput(key))
-	if err != nil || !created {
-		t.Fatalf("run=%#v created=%v err=%v", run, created, err)
-	}
-	return *run
+	return insertResearchRunFixtureForTest(t, store, researchStoreTestInput(key))
 }
 
 func researchStoreTestInput(key string) ResearchRunInput {
+	preflightDigest := sha256.Sum256([]byte(key))
 	return ResearchRunInput{
 		IdempotencyKey: key,
 		Request: ResearchRunRequest{
-			Mode: ResearchModeQuick, Question: fmt.Sprintf("Question for %s", key),
+			PreflightID: "research-preflight-fixture-" + hex.EncodeToString(preflightDigest[:16]),
+			Mode:        ResearchModeQuick, Question: fmt.Sprintf("Question for %s", key),
 			PackageID: "package-fixture", PackageVersion: "1.0.0",
 			RequestedSources: []string{ResearchSourceKnowledge},
 		},
@@ -243,4 +221,54 @@ func researchStoreTestInput(key string) ResearchRunInput {
 			MaxModelCalls: 4, MaxCostUSD: 0.5,
 		},
 	}
+}
+
+func insertResearchRunFixtureForTest(t *testing.T, store *ResearchStore, input ResearchRunInput) ResearchRun {
+	t.Helper()
+	if err := validateResearchRunInput(input); err != nil {
+		t.Fatal(err)
+	}
+	requestHash, err := hashResearchRunInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := store.now().UTC().Format(time.RFC3339Nano)
+	run := ResearchRun{
+		SchemaVersion: ResearchRunSchemaVersion, RunID: newResearchRunID(),
+		PreflightID: strings.TrimSpace(input.Request.PreflightID), Mode: input.Mode,
+		Question: strings.TrimSpace(input.Request.Question), Status: ResearchPlanning,
+		PackageID: strings.TrimSpace(input.Request.PackageID), PackageVersion: strings.TrimSpace(input.Request.PackageVersion),
+		SubjectIDs: append([]string(nil), input.Request.SubjectIDs...), RequestedSources: append([]string(nil), input.Request.RequestedSources...),
+		RouteReasons: append([]string(nil), input.RouteReasons...), Budget: input.Budget,
+		Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	values, err := marshalResearchRunValues(&run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`INSERT INTO research_runs (
+		run_id, parent_run_id, preflight_id, idempotency_key, request_hash, schema_version, mode, question, status,
+		package_id, package_version, subject_ids_json, requested_sources_json, route_reasons_json,
+		actual_scope_json, budget_json, wait_reason, failure_json, version, created_at, updated_at,
+		lease_owner, lease_epoch, lease_expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.RunID, run.ParentRunID, run.PreflightID, input.IdempotencyKey, requestHash, run.SchemaVersion, run.Mode, run.Question, run.Status,
+		run.PackageID, run.PackageVersion, values.subjectIDs, values.requestedSources, values.routeReasons,
+		values.actualScope, values.budget, run.WaitReason, values.failure, run.Version, run.CreatedAt, run.UpdatedAt,
+		run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertResearchEvent(tx, run.RunID, "", run.Status,
+		ResearchTransition{Code: "run_created", Actor: "test_fixture"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return run
 }

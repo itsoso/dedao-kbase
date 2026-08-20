@@ -6,8 +6,19 @@ import (
 	"testing"
 )
 
+func TestValidateResearchRunRequestRequiresPreflight(t *testing.T) {
+	err := ValidateResearchRunRequest(ResearchRunRequest{
+		Mode: ResearchModeQuick, Question: "question", PackageID: "research-agent", PackageVersion: "1.0.0",
+		RequestedSources: []string{ResearchSourceKnowledge},
+	})
+	if !errors.Is(err, ErrResearchPreflightRequired) {
+		t.Fatalf("missing preflight error=%v", err)
+	}
+}
+
 func TestRouteResearchModeChoosesDeepForPrivateHistory(t *testing.T) {
 	request := ResearchRunRequest{
+		PreflightID:      "research-preflight-route-private-history",
 		Mode:             ResearchModeAuto,
 		Question:         "Compare the current case with an earlier case.",
 		PackageID:        "research-agent",
@@ -26,6 +37,7 @@ func TestRouteResearchModeChoosesDeepForPrivateHistory(t *testing.T) {
 
 func TestRouteResearchModeChoosesDeepForPriorRuns(t *testing.T) {
 	request := ResearchRunRequest{
+		PreflightID:      "research-preflight-route-prior-runs",
 		Question:         "总结以前的研究结论",
 		PackageID:        "research-agent",
 		PackageVersion:   "1.0.0",
@@ -39,6 +51,7 @@ func TestRouteResearchModeChoosesDeepForPriorRuns(t *testing.T) {
 		t.Fatalf("expected prior runs to route deep, got mode=%q reasons=%v", mode, reasons)
 	}
 	if err := ValidateResearchModeScope(ResearchRunRequest{
+		PreflightID:      request.PreflightID,
 		Mode:             ResearchModeQuick,
 		Question:         request.Question,
 		PackageID:        request.PackageID,
@@ -51,6 +64,7 @@ func TestRouteResearchModeChoosesDeepForPriorRuns(t *testing.T) {
 
 func TestRouteResearchModeKeepsExplicitQuickButRequiresDeepForChatlog(t *testing.T) {
 	request := ResearchRunRequest{
+		PreflightID:      "research-preflight-route-chatlog",
 		Mode:             ResearchModeQuick,
 		Question:         "Summarize the earlier discussion.",
 		PackageID:        "research-agent",
@@ -72,6 +86,7 @@ func TestRouteResearchModeKeepsExplicitQuickButRequiresDeepForChatlog(t *testing
 
 func TestRouteResearchModeChoosesQuickForBoundedKnowledgeQuestion(t *testing.T) {
 	mode, reasons, err := RouteResearchMode(ResearchRunRequest{
+		PreflightID:      "research-preflight-route-knowledge",
 		Mode:             ResearchModeAuto,
 		Question:         "What does the selected collection say about sleep?",
 		PackageID:        "research-agent",

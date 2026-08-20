@@ -548,16 +548,13 @@ func researchPreflightPackageEligible(request ResearchPreflightRequest, facts Re
 	if err := validateResearchAgentPackageScope(pkg, request.Mode, request.RequestedSources); err != nil {
 		return false
 	}
-	resolvedMode, _, err := RouteResearchMode(ResearchRunRequest{
+	resolvedMode, _ := routeValidatedResearchMode(ResearchRunRequest{
 		Mode:             request.Mode,
 		Question:         request.Question,
 		PackageID:        pkg.PackageID,
 		PackageVersion:   pkg.Version,
 		RequestedSources: request.RequestedSources,
 	})
-	if err != nil {
-		return false
-	}
 	if resolvedMode != request.Mode {
 		if err := validateResearchAgentPackageScope(pkg, resolvedMode, request.RequestedSources); err != nil {
 			return false
