@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -907,6 +908,66 @@ func TestRankResearchPreflightCandidatesUsesStableReasonCodesOnly(t *testing.T) 
 	}
 	if candidates[0].DisplayName != "reason-agent" || candidates[0].EvaluationStatus != "passed" {
 		t.Fatalf("candidate safe summary = %#v", candidates[0])
+	}
+}
+
+func TestRankResearchPreflightCandidatesDeterministicCatalogWorkCeiling(t *testing.T) {
+	result := exerciseResearchPreflightRankerAtCatalogLimit(t)
+	if result.inputUnits != researchPreflightPackageMaxRecords {
+		t.Fatalf("ranker input units = %d, want %d", result.inputUnits, researchPreflightPackageMaxRecords)
+	}
+	assertResearchPreflightRankerCatalogResult(t, result, "bounded-agent-003")
+}
+
+type researchPreflightRankerWorkResult struct {
+	inputUnits    int
+	outputUnits   int
+	firstPackage  string
+	deterministic bool
+}
+
+func assertResearchPreflightRankerCatalogResult(
+	t *testing.T,
+	result researchPreflightRankerWorkResult,
+	wantFirst string,
+) {
+	t.Helper()
+	if result.outputUnits != researchPreflightCandidateMax {
+		t.Fatalf("ranker output units = %d, want ceiling %d", result.outputUnits, researchPreflightCandidateMax)
+	}
+	if result.firstPackage != wantFirst {
+		t.Fatalf("ranker first Package = %q, want %q", result.firstPackage, wantFirst)
+	}
+	if !result.deterministic {
+		t.Fatal("ranker output changed when the bounded catalog order changed")
+	}
+}
+
+func exerciseResearchPreflightRankerAtCatalogLimit(t *testing.T) researchPreflightRankerWorkResult {
+	t.Helper()
+	facts := make([]ResearchPreflightPackageFacts, researchPreflightPackageMaxRecords)
+	for index := range facts {
+		facts[index] = testResearchPreflightPackageFacts(t, fmt.Sprintf("bounded-agent-%03d", index))
+		facts[index].TopicHits = index % 4
+		facts[index].EvidenceHits = index % 9
+	}
+	request := ResearchPreflightRequest{
+		Mode: ResearchModeQuick, Question: "compare bounded evidence",
+		RequestedSources: []string{ResearchSourceKnowledge},
+	}
+	firstCandidates, firstGaps := RankResearchPreflightCandidates(request, facts)
+	reversed := append([]ResearchPreflightPackageFacts(nil), facts...)
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	secondCandidates, secondGaps := RankResearchPreflightCandidates(request, reversed)
+	firstPackage := ""
+	if len(firstCandidates) > 0 {
+		firstPackage = firstCandidates[0].PackageID
+	}
+	return researchPreflightRankerWorkResult{
+		inputUnits: len(facts), outputUnits: len(firstCandidates), firstPackage: firstPackage,
+		deterministic: reflect.DeepEqual(firstCandidates, secondCandidates) && reflect.DeepEqual(firstGaps, secondGaps),
 	}
 }
 

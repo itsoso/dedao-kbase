@@ -11,6 +11,30 @@ smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/research-agent-smoke.XXXXXX")"
 fixture_pid=""
 kbase_pid=""
 
+emit_failure_diagnostics() {
+  local status="$1"
+  local log_file=""
+  local file_name=""
+  local byte_count=""
+  local digest=""
+
+  printf 'research agent smoke failed: exit_status=%d\n' "$status" >&2
+  for log_file in "$smoke_root/kbase.log" "$smoke_root/worker.err" "$smoke_root/fixture.log"; do
+    [[ -f "$log_file" ]] || continue
+    file_name="$(basename "$log_file")"
+    byte_count="$(wc -c <"$log_file" | tr -d '[:space:]')"
+    digest="$(python3 - "$log_file" 2>/dev/null <<'PY'
+import hashlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    print(hashlib.sha256(source.read()).hexdigest())
+PY
+)" || digest="$(printf '%064d' 0)"
+    printf 'diagnostic file=%s bytes=%s sha256=%s\n' "$file_name" "$byte_count" "$digest" >&2
+  done
+}
+
 cleanup() {
   status=$?
   if [[ -n "$kbase_pid" ]]; then
@@ -22,25 +46,27 @@ cleanup() {
     wait "$fixture_pid" 2>/dev/null || true
   fi
   if [[ "$status" -ne 0 ]]; then
-    for log_file in "$smoke_root/kbase.log" "$smoke_root/worker.err" "$smoke_root/fixture.log" "$smoke_root/quick-detail.json"; do
-      [[ -f "$log_file" ]] && sed -n '1,120p' "$log_file" >&2
-    done
-    if [[ -f "$smoke_root/store/research_control.sqlite3" ]]; then
-      python3 - "$smoke_root/store/research_control.sqlite3" <<'PY' >&2
-import sqlite3
-import sys
-
-connection = sqlite3.connect(sys.argv[1])
-print("model invocations:", connection.execute(
-    "SELECT purpose, status, attempt FROM research_model_invocations ORDER BY created_at"
-).fetchall())
-PY
-    fi
+    emit_failure_diagnostics "$status"
   fi
   rm -rf "$smoke_root"
   return "$status"
 }
 trap cleanup EXIT INT TERM
+
+if [[ "${RESEARCH_AGENT_SMOKE_FAILURE_PRIVACY_SELF_TEST:-}" == "1" ]]; then
+  privacy_payload="${RESEARCH_AGENT_SMOKE_FAILURE_PRIVACY_PAYLOAD:-}"
+  printf '%s' "$privacy_payload" >"$smoke_root/kbase.log"
+  printf '%s' "$privacy_payload" >"$smoke_root/worker.err"
+  printf '%s' "$privacy_payload" >"$smoke_root/fixture.log"
+  exit 97
+fi
+
+if [[ "${RESEARCH_AGENT_SMOKE_SKIP_STANDARD_SELF_TESTS:-}" != "1" ]]; then
+  env RESEARCH_AGENT_SMOKE_SKIP_STANDARD_SELF_TESTS=1 \
+    python3 scripts/research-agent-smoke-binding-test.py
+  env RESEARCH_AGENT_SMOKE_SKIP_STANDARD_SELF_TESTS=1 \
+    bash scripts/research-agent-smoke-privacy-test.sh
+fi
 
 fixture_port_file="$smoke_root/fixture.port"
 python3 scripts/research-agent-smoke-fixture.py "$fixture_port_file" >"$smoke_root/fixture.log" 2>&1 &
@@ -110,7 +136,6 @@ for _ in $(seq 1 200); do
     break
   fi
   if ! kill -0 "$kbase_pid" 2>/dev/null; then
-    sed -n '1,120p' "$smoke_root/kbase.log" >&2
     exit 1
   fi
   sleep 0.05
@@ -181,9 +206,24 @@ quick_preflight_response="$smoke_root/quick-preflight.json"
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $auth_token" \
   -H 'Content-Type: application/json' \
-  --data "{\"mode\":\"quick\",\"question\":\"What does the synthetic collection evidence support?\",\"requested_sources\":[\"knowledge\"],\"package_constraint\":\"$collection_package_id\"}" \
+  --data '{"mode":"quick","question":"What does the synthetic collection evidence support?","requested_sources":["knowledge"]}' \
   "$kbase_url/api/research/preflight" >"$quick_preflight_response"
-quick_preflight_id="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); expected=(sys.argv[2],sys.argv[3]); candidates={(item["package_id"],item["package_version"]):item for item in value["candidates"]}; assert value["status"]=="ready" and expected in candidates and candidates[expected]["readiness"] in ("pass","warning"); print(value["preflight_id"])' "$quick_preflight_response" "$collection_package_id" "$collection_package_version")"
+quick_preflight_id="$(python3 - "$quick_preflight_response" "$collection_package_id" "$collection_package_version" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = (sys.argv[2], sys.argv[3])
+candidates = value["candidates"]
+assert value["status"] == "ready"
+assert 0 < len(candidates) <= 3
+assert (candidates[0]["package_id"], candidates[0]["package_version"]) == expected
+assert candidates[0]["readiness"] in ("pass", "warning")
+worker = next(item for item in value["checks"] if item["code"] == "worker")
+assert worker["status"] == "pass" and worker["result_code"] == "not_required"
+print(value["preflight_id"])
+PY
+)"
 
 quick_response="$smoke_root/quick-run.json"
 curl --fail --silent --show-error \
@@ -192,7 +232,8 @@ curl --fail --silent --show-error \
   -H 'Idempotency-Key: materialized-collection-quick-smoke' \
   --data "{\"preflight_id\":\"$quick_preflight_id\",\"mode\":\"quick\",\"question\":\"What does the synthetic collection evidence support?\",\"package_id\":\"$collection_package_id\",\"package_version\":\"$collection_package_version\",\"requested_sources\":[\"knowledge\"]}" \
   "$kbase_url/api/research/runs" >"$quick_response"
-quick_run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["run_id"])' "$quick_response")"
+quick_run_id="$(python3 scripts/research_agent_smoke_assertions.py create \
+  "$quick_response" "$quick_preflight_id" "$collection_package_id" "$collection_package_version" quick)"
 quick_detail="$smoke_root/quick-detail.json"
 for _ in $(seq 1 300); do
   curl --fail --silent --show-error -H "Authorization: Bearer $auth_token" \
@@ -202,7 +243,9 @@ for _ in $(seq 1 300); do
   [[ "$quick_status" == "failed" || "$quick_status" == "insufficient" || "$quick_status" == "canceled" ]] && exit 1
   sleep 0.1
 done
-python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); run=value["run"]; assert run["status"]=="completed"; assert run["actual_scope"]["searched_sources"]==["knowledge"]; assert run["actual_scope"]["cited_sources"]==["knowledge"]; assert len(value["evidence"])>=1; assert value["conclusions"][0]["citations"][0]["available"] is True' "$quick_detail"
+python3 scripts/research_agent_smoke_assertions.py detail \
+  "$quick_detail" "$quick_preflight_id" "$collection_package_id" "$collection_package_version" quick
+python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); run=value["run"]; assert run["actual_scope"]["searched_sources"]==["knowledge"]; assert run["actual_scope"]["cited_sources"]==["knowledge"]; assert len(value["evidence"])>=1; assert value["conclusions"][0]["citations"][0]["available"] is True' "$quick_detail"
 quick_citation_href="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["conclusions"][0]["citations"][0]["href"])' "$quick_detail")"
 curl --fail --silent --show-error -H "Authorization: Bearer $auth_token" \
   "$kbase_url$quick_citation_href" >"$smoke_root/quick-citation.json"
@@ -219,6 +262,122 @@ tools = [row[0] for row in connection.execute(
 assert "search_knowledge" in tools and "fetch_knowledge_evidence" in tools, tools
 PY
 
+linked_preflight_response="$smoke_root/linked-preflight.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  --data "{\"mode\":\"quick\",\"question\":\"What follow-up does the synthetic collection evidence support?\",\"requested_sources\":[\"knowledge\"],\"package_constraint\":\"$collection_package_id\",\"parent_run_id\":\"$quick_run_id\"}" \
+  "$kbase_url/api/research/preflight" >"$linked_preflight_response"
+linked_preflight_id="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); assert value["status"]=="ready" and value["parent_run_id"]==sys.argv[2]; print(value["preflight_id"])' "$linked_preflight_response" "$quick_run_id")"
+linked_response="$smoke_root/linked-run.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: materialized-collection-linked-smoke' \
+  --data "{\"preflight_id\":\"$linked_preflight_id\",\"mode\":\"quick\",\"question\":\"What follow-up does the synthetic collection evidence support?\",\"package_id\":\"$collection_package_id\",\"package_version\":\"$collection_package_version\",\"requested_sources\":[\"knowledge\"]}" \
+  "$kbase_url/api/research/runs" >"$linked_response"
+linked_run_id="$(python3 -c 'import json,sys; run=json.load(open(sys.argv[1], encoding="utf-8"))["run"]; assert run["parent_run_id"]==sys.argv[2]; print(run["run_id"])' "$linked_response" "$quick_run_id")"
+python3 - "$store_root/research_control.sqlite3" "$linked_run_id" "$quick_run_id" <<'PY'
+import sqlite3
+import sys
+
+database, run_id, parent_run_id = sys.argv[1:]
+connection = sqlite3.connect(database)
+stored_parent = connection.execute(
+    "SELECT parent_run_id FROM research_runs WHERE run_id = ?", (run_id,)
+).fetchone()
+assert stored_parent == (parent_run_id,)
+PY
+
+rejected_run_count="$(python3 - "$store_root/research_control.sqlite3" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+print(connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0])
+PY
+)"
+
+expired_preflight_response="$smoke_root/expired-preflight.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  --data "{\"mode\":\"quick\",\"question\":\"What expired synthetic evidence is available?\",\"requested_sources\":[\"knowledge\"],\"package_constraint\":\"$collection_package_id\"}" \
+  "$kbase_url/api/research/preflight" >"$expired_preflight_response"
+expired_preflight_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["preflight_id"])' "$expired_preflight_response")"
+python3 - "$store_root/research_control.sqlite3" "$expired_preflight_id" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    "UPDATE research_preflights SET created_at = ?, expires_at = ? WHERE preflight_id = ?",
+    ("2000-01-01T00:00:00.000000000Z", "2000-01-01T00:10:00.000000000Z", sys.argv[2]),
+)
+connection.commit()
+PY
+expired_status="$(curl --silent --show-error --output "$smoke_root/expired-run-error.json" --write-out '%{http_code}' \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: expired-preflight-smoke' \
+  --data "{\"preflight_id\":\"$expired_preflight_id\",\"mode\":\"quick\",\"question\":\"What expired synthetic evidence is available?\",\"package_id\":\"$collection_package_id\",\"package_version\":\"$collection_package_version\",\"requested_sources\":[\"knowledge\"]}" \
+  "$kbase_url/api/research/runs")"
+[[ "$expired_status" == "410" ]]
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1], encoding="utf-8")) == {"error":"preflight_expired"}' "$smoke_root/expired-run-error.json"
+
+foreign_preflight_response="$smoke_root/foreign-preflight.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  --data "{\"mode\":\"quick\",\"question\":\"What owner-bound synthetic evidence is available?\",\"requested_sources\":[\"knowledge\"],\"package_constraint\":\"$collection_package_id\"}" \
+  "$kbase_url/api/research/preflight" >"$foreign_preflight_response"
+foreign_preflight_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["preflight_id"])' "$foreign_preflight_response")"
+python3 - "$store_root/research_control.sqlite3" "$foreign_preflight_id" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    "UPDATE research_preflights SET owner_hash = ? WHERE preflight_id = ?",
+    ("b" * 64, sys.argv[2]),
+)
+connection.commit()
+PY
+foreign_status="$(curl --silent --show-error --output "$smoke_root/foreign-run-error.json" --write-out '%{http_code}' \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: foreign-preflight-smoke' \
+  --data "{\"preflight_id\":\"$foreign_preflight_id\",\"mode\":\"quick\",\"question\":\"What owner-bound synthetic evidence is available?\",\"package_id\":\"$collection_package_id\",\"package_version\":\"$collection_package_version\",\"requested_sources\":[\"knowledge\"]}" \
+  "$kbase_url/api/research/runs")"
+[[ "$foreign_status" == "404" ]]
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1], encoding="utf-8")) == {"error":"research_preflight_not_found"}' "$smoke_root/foreign-run-error.json"
+python3 - "$store_root/research_control.sqlite3" "$rejected_run_count" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+assert connection.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0] == int(sys.argv[2])
+PY
+
+blocked_preflight_response="$smoke_root/blocked-preflight.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $auth_token" \
+  -H 'Content-Type: application/json' \
+  --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"],\"package_constraint\":\"$research_package_id\"}" \
+  "$kbase_url/api/research/preflight" >"$blocked_preflight_response"
+python3 - "$blocked_preflight_response" "$research_package_id" "$research_package_version" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = (sys.argv[2], sys.argv[3])
+assert value["status"] == "blocked"
+assert 0 < len(value["candidates"]) <= 3
+assert (value["candidates"][0]["package_id"], value["candidates"][0]["package_version"]) == expected
+worker = next(item for item in value["checks"] if item["code"] == "worker")
+assert worker["status"] == "blocked" and worker["result_code"] != "not_required"
+PY
+
 env \
   KBASE_REMOTE_URL="$kbase_url" \
   KBASE_SOURCE_AGENT_TOKEN="$source_token" \
@@ -233,7 +392,22 @@ curl --fail --silent --show-error \
   -H 'Content-Type: application/json' \
   --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"],\"package_constraint\":\"$research_package_id\"}" \
   "$kbase_url/api/research/preflight" >"$deep_preflight_response"
-deep_preflight_id="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); expected=(sys.argv[2],sys.argv[3]); candidates={(item["package_id"],item["package_version"]):item for item in value["candidates"]}; assert value["status"]=="ready" and expected in candidates and candidates[expected]["readiness"] in ("pass","warning"); print(value["preflight_id"])' "$deep_preflight_response" "$research_package_id" "$research_package_version")"
+deep_preflight_id="$(python3 - "$deep_preflight_response" "$research_package_id" "$research_package_version" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = (sys.argv[2], sys.argv[3])
+candidates = value["candidates"]
+assert value["status"] == "ready"
+assert 0 < len(candidates) <= 3
+assert (candidates[0]["package_id"], candidates[0]["package_version"]) == expected
+assert candidates[0]["readiness"] in ("pass", "warning")
+worker = next(item for item in value["checks"] if item["code"] == "worker")
+assert worker["status"] == "pass" and worker["result_code"] == "online"
+print(value["preflight_id"])
+PY
+)"
 
 run_response="$smoke_root/run.json"
 curl --fail --silent --show-error \
@@ -242,7 +416,8 @@ curl --fail --silent --show-error \
   -H 'Idempotency-Key: full-stack-smoke' \
   --data "{\"preflight_id\":\"$deep_preflight_id\",\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"package_id\":\"$research_package_id\",\"package_version\":\"$research_package_version\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"]}" \
   "$kbase_url/api/research/runs" >"$run_response"
-run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["run_id"])' "$run_response")"
+run_id="$(python3 scripts/research_agent_smoke_assertions.py create \
+  "$run_response" "$deep_preflight_id" "$research_package_id" "$research_package_version" deep)"
 
 worker_output="$smoke_root/worker.json"
 detail_response="$smoke_root/detail.json"
@@ -266,7 +441,9 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 [[ "$worker_job_completed" == "true" ]]
-python3 -c 'import json,sys; run=json.load(open(sys.argv[1]))["run"]; assert run["status"]=="completed"; assert run["actual_scope"]["searched_sources"]==["chatlog"]; assert run["actual_scope"]["cited_sources"]==["chatlog"]' "$detail_response"
+python3 scripts/research_agent_smoke_assertions.py detail \
+  "$detail_response" "$deep_preflight_id" "$research_package_id" "$research_package_version" deep
+python3 -c 'import json,sys; run=json.load(open(sys.argv[1]))["run"]; assert run["actual_scope"]["searched_sources"]==["chatlog"]; assert run["actual_scope"]["cited_sources"]==["chatlog"]' "$detail_response"
 
 events_response="$smoke_root/events.json"
 curl --fail --silent --show-error -H "Authorization: Bearer $auth_token" \

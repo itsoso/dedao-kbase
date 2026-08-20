@@ -645,6 +645,67 @@ func TestResearchPreflightServiceBoundsPackageCatalogBeforeEvaluation(t *testing
 	})
 }
 
+func TestResearchPreflightServiceDeterministicCatalogWorkCeiling(t *testing.T) {
+	result := exerciseResearchPreflightServiceAtCatalogLimit(t)
+	if result.catalogUnits != researchPreflightPackageMaxRecords {
+		t.Fatalf("service catalog units = %d, want %d", result.catalogUnits, researchPreflightPackageMaxRecords)
+	}
+	if result.publishedUnits != 4 || result.artifactLoads != result.publishedUnits {
+		t.Fatalf("service published/artifact units = %d/%d, want 4/4", result.publishedUnits, result.artifactLoads)
+	}
+	if result.candidates != researchPreflightCandidateMax {
+		t.Fatalf("service candidates = %d, want ceiling %d", result.candidates, researchPreflightCandidateMax)
+	}
+}
+
+type researchPreflightServiceWorkResult struct {
+	catalogUnits   int
+	publishedUnits int
+	artifactLoads  int
+	candidates     int
+}
+
+func exerciseResearchPreflightServiceAtCatalogLimit(t *testing.T) researchPreflightServiceWorkResult {
+	t.Helper()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	const publishedUnits = 4
+	for index := 0; index < publishedUnits; index++ {
+		publishResearchPreflightServicePackage(
+			t, knowledge, fmt.Sprintf("bounded-service-agent-%02d", index),
+			fmt.Sprintf("bounded-service-release-%02d", index),
+			fmt.Sprintf("bounded-service-citation-%02d", index),
+			"bounded service evidence", now, nil,
+		)
+	}
+	prependResearchPreflightCatalogRecords(t, knowledge, researchPreflightPackageMaxRecords-publishedUnits)
+	research := openResearchPreflightServiceStore(t, knowledge.Root(), now)
+	previous := agentPackageArtifactLoadHook
+	artifactLoads := 0
+	agentPackageArtifactLoadHook = func(context.Context, string) error {
+		artifactLoads++
+		return nil
+	}
+	t.Cleanup(func() { agentPackageArtifactLoadHook = previous })
+	result, err := testResearchPreflightService(knowledge, research, nil, now).Evaluate(
+		context.Background(), testResearchPreflightOwnerA, ResearchPreflightRequest{
+			Mode: ResearchModeQuick, Question: "bounded service evidence",
+			RequestedSources: []string{ResearchSourceKnowledge},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != ResearchPreflightStatusReady || len(result.Candidates) != researchPreflightCandidateMax ||
+		result.Candidates[0].PackageID != "bounded-service-agent-00" {
+		t.Fatalf("bounded service result = %#v", result)
+	}
+	return researchPreflightServiceWorkResult{
+		catalogUnits: researchPreflightPackageMaxRecords, publishedUnits: publishedUnits,
+		artifactLoads: artifactLoads, candidates: len(result.Candidates),
+	}
+}
+
 func testResearchPreflightService(
 	knowledge *BookKnowledgeStore,
 	research *ResearchStore,
