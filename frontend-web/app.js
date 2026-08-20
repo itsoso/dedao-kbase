@@ -352,23 +352,30 @@ const agentCompilerState = {
 
 const researchTerminalStatuses = new Set(["completed", "insufficient", "failed", "canceled"]);
 const researchRecentRunsKey = "kbase.research.recent-runs.v1";
+const researchPreflightDebounceMS = 600;
 const researchState = {
   draft: {
     question: "",
     mode: "auto",
     sources: ["knowledge"],
-    packageID: "",
-    packageVersion: "",
+    subjectIDs: [],
   },
+  preflight: null,
+  preflightFingerprint: "",
+  selectedCandidateKey: "",
+  parentRunID: "",
   recentRuns: [],
   detail: null,
   events: [],
   nextSequence: 0,
   activeTab: "evidence",
-  loading: { list: false, detail: false, events: false, create: false, cancel: false, identity: "" },
+  loading: { list: false, detail: false, events: false, preflight: false, create: false, cancel: false, identity: "" },
+  error: "",
   message: "",
 };
 let researchEventPollTimer = null;
+let researchPreflightDebounceTimer = null;
+let researchPreflightExpiryTimer = null;
 
 function createResearchLatestRequestController() {
   let controller = null;
@@ -391,9 +398,34 @@ function createResearchLatestRequestController() {
   };
 }
 
+function createResearchPreflightRequestController() {
+  let controller = null;
+  let sequence = 0;
+  let fingerprint = "";
+  return {
+    begin(nextFingerprint) {
+      controller?.abort();
+      controller = typeof AbortController === "function" ? new AbortController() : null;
+      sequence += 1;
+      fingerprint = String(nextFingerprint || "");
+      return { sequence, fingerprint, signal: controller?.signal };
+    },
+    isCurrent(candidateSequence, candidateFingerprint) {
+      return candidateSequence === sequence && candidateFingerprint === fingerprint;
+    },
+    cancel() {
+      controller?.abort();
+      controller = null;
+      sequence += 1;
+      fingerprint = "";
+    },
+  };
+}
+
 const researchListRequestController = createResearchLatestRequestController();
 const researchDetailRequestController = createResearchLatestRequestController();
 const researchEventsRequestController = createResearchLatestRequestController();
+const researchPreflightRequestController = createResearchPreflightRequestController();
 
 const evolutionConsoleState = {
   route: { view: "inbox", risk: [], type: "", run: "", tab: "comparison", cursor: "", drawer: "" },
@@ -11444,22 +11476,171 @@ function researchFailurePresentation(failure) {
   return ({ worker_offline: ["本地 Worker 未在线", "确认 macOS Worker 已启动并连接后，再新建一次研究。"], worker_failed: ["本地 Worker 执行失败", "Worker 已连接，但本地查询或返回数据失败；请在 Agent 健康页检查 Chatlog 服务后重试。"], identity_ambiguous: ["身份仍有歧义", "在身份候选区确认正确对象；不要仅凭昵称推断。"], zero_hit: ["没有找到可用证据", "调整关键词、时间范围或增加一个允许的数据源。"], partial_evidence: ["只取得部分证据", "报告会保留缺口，不会把缺失部分补写成事实。"], budget_exhausted: ["研究预算已用完", "缩小问题范围，或新建深度研究并提高受控预算。"], citation_mismatch: ["引用核验未通过", "检查来源是否发生变化后重新运行。"], source_changed: ["来源内容已变化", "重新检索并生成新的可核验快照。"], model_timeout: ["模型调用超时", "稍后重试；已完成步骤不会被描述为最终结论。"], planner_invalid_output: ["研究规划输出无效", "系统已自动修复一次，但规划结果仍不符合工具和结构约束；请检查规划模型后重试。"], extractor_invalid_output: ["事实提取输出无效", "系统已自动修复一次，但事实或引用仍未通过严格校验；请检查提取模型后重试。"], synthesizer_invalid_output: ["研究综合输出无效", "系统已自动修复一次，但结论结构或证据引用仍无效；请检查综合模型后重试。"], verifier_invalid_output: ["引用核验输出无效", "系统已自动修复一次，但核验结果仍不符合结论引用约束；请检查核验模型后重试。"], invalid_model_output: ["模型输出格式无效", "系统已终止本次运行且不会重复执行；请检查角色模型或稍后新建研究。"] })[code] || ["研究未能完成", "查看阶段记录并缩小范围后重新发起。"];
 }
 
-function validateResearchCreateDraft(draft) {
-  if (!draft?.question) {
-    return "研究问题为必填。请先提出一个明确、可验证的问题。";
-  }
-  if (!draft?.packageID || !draft?.packageVersion) {
-    return "Agent Package 和版本为必填。请从 Agent 管理选择已发布且支持研究的版本。";
-  }
+function researchSourceOrder(source) {
+  return ({ knowledge: 0, chatlog: 1, prior_runs: 2 })[source] ?? 99;
+}
+
+function normalizeResearchDraft(draft) {
+  const mode = String(draft?.mode || "auto").trim();
+  const normalizedMode = ["quick", "auto", "deep"].includes(mode) ? mode : "auto";
+  const sources = [...new Set((Array.isArray(draft?.sources) ? draft.sources : [])
+    .map((value) => String(value || "").trim())
+    .filter((value) => ["knowledge", "chatlog", "prior_runs"].includes(value)))]
+    .sort((left, right) => researchSourceOrder(left) - researchSourceOrder(right));
+  const subjectIDs = [...new Set((Array.isArray(draft?.subjectIDs) ? draft.subjectIDs : [])
+    .map((value) => String(value || "").trim()).filter(Boolean))].sort();
+  const normalized = {
+    question: String(draft?.question || "").trim(),
+    mode: normalizedMode,
+    sources: sources.length ? sources : ["knowledge"],
+    subjectIDs,
+  };
+  const packageConstraint = String(draft?.packageConstraint || "").trim();
+  const parentRunID = String(draft?.parentRunID || "").trim();
+  if (packageConstraint) normalized.packageConstraint = packageConstraint;
+  if (parentRunID) normalized.parentRunID = parentRunID;
+  return normalized;
+}
+
+function researchDraftFingerprint(draft) {
+  const normalized = normalizeResearchDraft(draft);
+  return JSON.stringify({
+    mode: normalized.mode,
+    question: normalized.question,
+    requested_sources: normalized.sources,
+    subject_ids: normalized.subjectIDs,
+    package_constraint: normalized.packageConstraint || "",
+    parent_run_id: normalized.parentRunID || "",
+  });
+}
+
+function researchCandidateKey(candidate) {
+  return `${String(candidate?.package_id || "")}\u0000${String(candidate?.package_version || "")}`;
+}
+
+function selectResearchPreflightCandidate(previousKey, candidates) {
+  const bounded = Array.isArray(candidates) ? candidates.slice(0, 3) : [];
+  if (bounded.some((candidate) => researchCandidateKey(candidate) === previousKey)) return previousKey;
+  return bounded.length ? researchCandidateKey(bounded[0]) : "";
+}
+
+function applyResearchPreflightResponse(state, controller, request, payload, draft) {
+  const fingerprint = researchDraftFingerprint(draft);
+  if (!controller.isCurrent(request.sequence, request.fingerprint) || request.fingerprint !== fingerprint) return false;
+  const bounded = { ...payload, candidates: (Array.isArray(payload?.candidates) ? payload.candidates : []).slice(0, 3) };
+  state.preflight = bounded;
+  state.preflightFingerprint = fingerprint;
+  state.selectedCandidateKey = selectResearchPreflightCandidate(state.selectedCandidateKey, bounded.candidates);
+  state.loading.preflight = false;
+  state.error = "";
+  return true;
+}
+
+function researchSelectedCandidate(preflight, selectedCandidateKey) {
+  return (Array.isArray(preflight?.candidates) ? preflight.candidates : [])
+    .find((candidate) => researchCandidateKey(candidate) === selectedCandidateKey) || null;
+}
+
+function researchRunStartBlockReason(draft, preflight, selectedCandidateKey, preflightFingerprint, now = Date.now(), loading = false) {
+  const normalized = normalizeResearchDraft(draft);
+  if (!normalized.question) return "请先填写研究问题。";
+  if (loading) return "正在完成运行前检查。";
+  if (!preflight?.preflight_id) return "请等待自动预检完成。";
+  if (researchDraftFingerprint(normalized) !== preflightFingerprint) return "问题或范围已变化，请等待新的预检。";
+  const expiresAt = Date.parse(String(preflight.expires_at || ""));
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) return "本次预检已过期，请等待刷新。";
+  if (preflight.status !== "ready") return "运行条件存在阻断，请先处理后再开始。";
+  if ((Array.isArray(preflight.checks) ? preflight.checks : []).some((check) => check?.status === "blocked")) return "运行前检查存在阻断。";
+  const selected = researchSelectedCandidate(preflight, selectedCandidateKey);
+  if (!selected) return "请确认一个推荐 Agent。";
+  if (selected.readiness === "blocked") return "所选 Agent 尚未准备就绪。";
   return "";
 }
 
-function researchCreateErrorMessage(error) {
+function buildResearchRunRequest(draft, preflight, candidate) {
+  const normalized = normalizeResearchDraft(draft);
+  return {
+    preflight_id: String(preflight?.preflight_id || ""),
+    mode: normalized.mode,
+    question: normalized.question,
+    requested_sources: normalized.sources,
+    subject_ids: normalized.subjectIDs,
+    package_id: String(candidate?.package_id || ""),
+    package_version: String(candidate?.package_version || ""),
+  };
+}
+
+function prepareResearchRunSubmission(draft, state, now = Date.now()) {
+  const blockReason = researchRunStartBlockReason(
+    draft, state?.preflight, state?.selectedCandidateKey,
+    state?.preflightFingerprint, now, Boolean(state?.loading?.preflight),
+  );
+  const candidate = researchSelectedCandidate(state?.preflight, state?.selectedCandidateKey);
+  if (blockReason || !candidate) return { blockReason: blockReason || "请确认一个推荐 Agent。", candidate: null, payload: null };
+  return { blockReason: "", candidate, payload: buildResearchRunRequest(draft, state.preflight, candidate) };
+}
+
+function researchPreflightErrorMessage(error) {
   const code = String(error?.message || error || "");
   return ({
-    "invalid_research_request": "研究参数无效。请确认研究问题、Agent Package、版本、模式和来源均已填写。",
-    "research_package_not_eligible": "当前 Agent Package 不支持所选模式或来源。请前往 Agent 管理选择已发布且支持研究的版本。",
-  })[code] || code;
+    "invalid_research_preflight_request": "问题或范围不符合预检要求，请检查后重试。",
+    "research_preflight_not_found": "本次预检不存在或不属于当前会话，请重新预检。",
+    "research_preflight_expired": "本次预检已过期，正在准备新的检查。",
+    "research_preflight_conflict": "预检状态已变化，请重新确认推荐 Agent。",
+    "research_preflight_unavailable": "运行前检查暂时不可用，请稍后重试。",
+    "no_eligible_package": "没有找到符合策略的 Agent，请先创建或补全 Agent。",
+    "insufficient_coverage": "当前 Agent 的知识覆盖不足，请补充知识后重试。",
+    "worker_offline": "本地 Worker 未在线，所选来源暂时不能运行。",
+    "source_not_allowed": "所选来源不在 Agent 的允许范围内。",
+    "budget_insufficient": "当前运行预算不足，请缩小范围或调整预算。",
+    "preflight_required": "开始研究前必须先完成运行前检查。",
+    "preflight_expired": "本次预检已过期，正在准备新的检查。",
+    "package_changed": "Agent 版本已变化，请重新预检并确认。",
+    "readiness_changed": "运行条件已变化，请重新预检。",
+    "preflight_blocked": "运行前检查存在阻断，不能创建研究。",
+    "invalid_research_request": "研究参数无效，请检查问题、模式和来源。",
+    "research_package_not_eligible": "当前 Agent 不支持所选研究范围。",
+    "research_service_unavailable": "研究服务暂时不可用，请稍后重试。",
+    "research_idempotency_conflict": "本次创建请求与已有请求冲突，请重新开始。",
+    "method_not_allowed": "当前操作方式不受支持。",
+    "unauthorized": "当前会话已失效，请重新登录。",
+  })[code] || "运行前检查未完成，请稍后重试。";
+}
+
+function researchCreateErrorMessage(error) {
+  return researchPreflightErrorMessage(error);
+}
+
+function researchMatchLabel(value) {
+  return ({ high: "高匹配", medium: "中匹配", low: "低匹配" })[value] || "待判断";
+}
+
+function researchReadinessLabel(value) {
+  return ({ pass: "通过", warning: "提醒", blocked: "阻断" })[value] || "待检查";
+}
+
+function researchReasonLabel(value) {
+  return ({ topic_match: "主题与问题相符", evidence_coverage: "已有证据命中", fresh_release: "知识更新较新", trusted_evaluation: "可信评测通过", worker_ready: "本地 Worker 就绪" })[value] || "";
+}
+
+function researchSourceLabel(value) {
+  return ({ knowledge: "知识库", chatlog: "本地聊天记录", prior_runs: "历史研究" })[value] || "其他受控来源";
+}
+
+function researchEvaluationLabel(value) {
+  return ({ passed: "可信评测通过", failed: "评测未通过", pending: "等待评测" })[value] || "评测状态待核";
+}
+
+function researchCheckLabel(value) {
+  return ({ package_integrity: "Agent Package", trusted_evaluation: "可信评测", agent_package: "Agent 候选", knowledge_coverage: "知识覆盖", worker: "Worker", source_permissions: "来源权限", budget: "预算", coverage_integrity: "知识完整性" })[value] || "其他检查";
+}
+
+function researchCheckResultLabel(value) {
+  return ({ validated: "校验通过", invalid: "存在异常项", none: "没有可用候选", zero_hits: "未命中直接证据", covered: "已有证据覆盖", not_required: "当前范围不需要", online: "在线", degraded: "服务降级", requires_action: "需要人工处理", offline: "离线", upgrading: "升级中", allowed: "来源允许", denied: "来源不允许", insufficient: "预算不足", resolved_quick: "快速预算已确认", resolved_deep: "深度预算已确认", candidate_specific: "按候选分别确认", excluded: "异常知识已排除" })[value] || "结果待核";
+}
+
+function researchGapLabel(value) {
+  return ({ no_eligible_package: "没有符合策略的 Agent", insufficient_coverage: "知识覆盖不足", worker_offline: "本地 Worker 未在线", source_not_allowed: "来源不在允许范围", budget_insufficient: "运行预算不足" })[value] || "存在尚未满足的运行条件";
 }
 
 function researchRecentRunIDs() {
@@ -11532,6 +11713,73 @@ function renderResearchTabPanel(detail, activeTab) {
   return renderResearchEvidence(detail?.evidence);
 }
 
+function researchCandidateDisplayName(candidate, index) {
+  const displayName = String(candidate?.display_name || "").trim();
+  const packageID = String(candidate?.package_id || "").trim();
+  return displayName && displayName !== packageID ? displayName : `研究 Agent ${String(index + 1).padStart(2, "0")}`;
+}
+
+function researchUpdatedAtLabel(value) {
+  const parsed = Date.parse(String(value || ""));
+  if (!Number.isFinite(parsed)) return "更新时间待核";
+  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(parsed));
+}
+
+function renderResearchCandidateCards(preflight) {
+  const candidates = (Array.isArray(preflight?.candidates) ? preflight.candidates : []).slice(0, 3);
+  if (!candidates.length) return `<p class="research-preflight__empty">没有可确认的 Agent 候选。</p>`;
+  return `<fieldset class="research-agent-list"><legend class="visually-hidden">选择推荐 Agent</legend>${candidates.map((candidate, index) => {
+    const key = researchCandidateKey(candidate);
+    const selected = key === researchState.selectedCandidateKey;
+    const reasons = (Array.isArray(candidate.reason_codes) ? candidate.reason_codes : []).map(researchReasonLabel).filter(Boolean).slice(0, 3);
+    const knowledgeScope = (Array.isArray(candidate.knowledge_scope) ? candidate.knowledge_scope : []).map(researchSourceLabel);
+    const supportedSources = (Array.isArray(candidate.supported_sources) ? candidate.supported_sources : []).map(researchSourceLabel);
+    const coverage = candidate.coverage || {};
+    const budget = candidate.budget || {};
+    const limits = budget.limits || {};
+    return `<article class="research-agent-card ${selected ? "is-selected" : ""} is-${escapeAttribute(candidate.readiness || "unknown")}" data-research-candidate-card="${index}">
+      <header><input id="research-agent-${index}" type="radio" name="research_candidate" value="${index}" data-research-candidate="${index}" aria-describedby="research-agent-${index}-summary" ${selected ? "checked" : ""}><label for="research-agent-${index}"><span>${escapeHTML(researchMatchLabel(candidate.match_level))}</span><strong>${escapeHTML(researchCandidateDisplayName(candidate, index))}</strong></label><b>${escapeHTML(researchReadinessLabel(candidate.readiness))}</b></header>
+      <div id="research-agent-${index}-summary" class="research-agent-card__summary"><span>匹配理由</span><ul>${reasons.length ? reasons.map((reason) => `<li>${escapeHTML(reason)}</li>`).join("") : "<li>按稳定规则进入候选</li>"}</ul></div>
+      <dl><div><dt>知识范围</dt><dd>${escapeHTML(knowledgeScope.join("、") || "固定知识范围")}</dd></div><div><dt>更新时间</dt><dd>${escapeHTML(researchUpdatedAtLabel(candidate.updated_at))}</dd></div><div><dt>评测</dt><dd>${escapeHTML(researchEvaluationLabel(candidate.evaluation_status))}</dd></div><div><dt>来源</dt><dd>${escapeHTML(supportedSources.join("、") || "受控来源")}</dd></div><div><dt>运行准备</dt><dd>${escapeHTML(researchReadinessLabel(candidate.readiness))}</dd></div></dl>
+      <details><summary>技术详情</summary><div><span>Package ID</span><code>${escapeHTML(candidate.package_id || "-")}</code><span>Version</span><code>${escapeHTML(candidate.package_version || "-")}</code><span>覆盖</span><code>${Number(coverage.evidence_count || 0)} 条证据 · ${Number(coverage.release_count || 0)} 个 Release · ${Number(coverage.citation_count || 0)} 条引用</code><span>预算</span><code>${escapeHTML(budget.resolved_mode === "deep" ? "深度" : "快速")} · ${Number(limits.max_evidence_items || 0)} 条证据上限</code></div></details>
+    </article>`;
+  }).join("")}</fieldset>`;
+}
+
+function renderResearchChecks(preflight) {
+  const checks = Array.isArray(preflight?.checks) ? preflight.checks : [];
+  if (!checks.length) return `<p class="research-preflight__empty">等待 Worker、来源和预算检查。</p>`;
+  return `<div class="research-checks">${checks.map((check) => `<article class="is-${escapeAttribute(check.status || "unknown")}"><span aria-hidden="true">${check.status === "pass" ? "✓" : check.status === "warning" ? "!" : "×"}</span><div><strong>${escapeHTML(researchCheckLabel(check.code))}</strong><small>${escapeHTML(researchCheckResultLabel(check.result_code))}</small></div><b>${escapeHTML(researchReadinessLabel(check.status))}</b></article>`).join("")}</div>`;
+}
+
+function renderResearchPreflight() {
+  const preflight = researchState.preflight;
+  const loading = researchState.loading.preflight;
+  const blockReason = researchRunStartBlockReason(
+    researchState.draft, preflight, researchState.selectedCandidateKey,
+    researchState.preflightFingerprint, Date.now(), loading,
+  );
+  const gaps = Array.isArray(preflight?.gaps) ? preflight.gaps : [];
+  const statusText = loading
+    ? "正在匹配 Agent 并检查运行条件…"
+    : researchState.error
+      ? researchState.error
+      : preflight
+        ? `${(preflight.candidates || []).length} 个候选 · ${preflight.status === "ready" ? "等待人工确认" : "存在阻断"}`
+        : researchState.draft.question
+          ? "停止输入后将自动预检。"
+          : "填写问题后自动推荐 Agent。";
+  return `<section class="research-preflight" aria-labelledby="research-preflight-title" aria-busy="${loading ? "true" : "false"}">
+    <header><div><span>02 / 自动预检与人工确认</span><h2 id="research-preflight-title">推荐 Agent</h2></div><p data-research-preflight-status aria-live="polite" aria-atomic="true">${escapeHTML(statusText)}</p></header>
+    <div class="research-preflight__grid">
+      <section aria-labelledby="research-candidates-title"><div class="research-preflight__section-title"><span>候选</span><h3 id="research-candidates-title">最多三项，默认首选</h3></div><div data-research-candidate-list>${loading ? `<p class="research-preflight__empty">正在按知识覆盖与评测排序…</p>` : renderResearchCandidateCards(preflight)}</div></section>
+      <section aria-labelledby="research-checks-title"><div class="research-preflight__section-title"><span>检查</span><h3 id="research-checks-title">运行前检查</h3></div><div data-research-check-list>${loading ? `<p class="research-preflight__empty">正在检查 Worker、来源与预算…</p>` : renderResearchChecks(preflight)}</div></section>
+    </div>
+    ${preflight?.status === "blocked" || gaps.length ? `<aside class="research-preflight__blocked" role="alert"><strong>当前不能开始研究</strong><ul>${gaps.length ? gaps.map((gap) => `<li>${escapeHTML(researchGapLabel(gap.code))}</li>`).join("") : "<li>请处理阻断项后重新预检。</li>"}</ul><a class="button button-ghost" href="${escapeAttribute(ROUTES.agentPackages)}">创建 / 补全 Agent</a></aside>` : ""}
+    <footer><p id="research-start-guidance">${escapeHTML(blockReason || "预检有效，确认所选 Agent 后即可开始。")}</p><button class="button button-primary" type="submit" ${blockReason || researchState.loading.create ? "disabled" : ""} aria-describedby="research-start-guidance">${researchState.loading.create ? "正在创建…" : "开始研究"}</button></footer>
+  </section>`;
+}
+
 function renderResearchWorkspace(route = getResearchRoute()) {
   const detail = researchState.detail || {};
   const run = detail.run || null;
@@ -11545,11 +11793,14 @@ function renderResearchWorkspace(route = getResearchRoute()) {
   renderShell(`<main class="research-workspace">
     <header class="research-workspace__heading"><div><p class="web-kicker">RESEARCH DOSSIER / 研究案卷</p><h1>研究工作台</h1></div><p>围绕一个明确问题，记录检索范围、证据选择、身份边界与引用核验。</p></header>
     <form class="research-launchpad" id="research-create-form" aria-label="发起研究" novalidate>
-      <label class="research-launchpad__question"><span>研究问题</span><textarea name="question" rows="2" required placeholder="例如：比较当前建议与去年同类案例，有哪些适用差异？">${escapeHTML(researchState.draft.question)}</textarea></label>
-      <fieldset><legend>模式</legend>${modeChoices.map(([value, label]) => `<label><input type="radio" name="mode" value="${value}" ${researchState.draft.mode === value ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
-      <fieldset><legend>来源</legend>${sourceChoices.map(([value, label]) => `<label><input type="checkbox" name="sources" value="${value}" ${researchState.draft.sources.includes(value) ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
-      <div class="research-launchpad__scope"><label><span>Agent Package（必填） · <a href="${escapeAttribute(ROUTES.agentPackages)}">去 Agent 管理选择</a></span><input name="package_id" value="${escapeAttribute(researchState.draft.packageID)}" placeholder="必填" required></label><label><span>版本（必填）</span><input name="package_version" value="${escapeAttribute(researchState.draft.packageVersion)}" placeholder="必填" required></label></div>
-      <button class="button button-primary" type="submit" ${researchState.loading.create ? "disabled" : ""}>${researchState.loading.create ? "正在创建…" : "开始研究"}</button>
+      <section class="research-launchpad__draft" aria-labelledby="research-draft-title"><header><span>01 / 定义研究</span><h2 id="research-draft-title">问题与范围</h2><p>问题停笔约 600ms 后，系统自动匹配 Agent；不会把问题写入网址或浏览器存储。</p></header>
+        <div class="research-launchpad__draft-grid">
+          <label class="research-launchpad__question"><span>研究问题</span><textarea name="question" rows="3" required placeholder="例如：比较当前建议与去年同类案例，有哪些适用差异？">${escapeHTML(researchState.draft.question)}</textarea></label>
+          <fieldset><legend>模式</legend>${modeChoices.map(([value, label]) => `<label><input type="radio" name="mode" value="${value}" ${researchState.draft.mode === value ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
+          <fieldset><legend>来源</legend>${sourceChoices.map(([value, label]) => `<label><input type="checkbox" name="sources" value="${value}" ${researchState.draft.sources.includes(value) ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
+        </div>
+      </section>
+      ${renderResearchPreflight()}
     </form>
     ${researchState.message ? `<p class="research-workspace__message" aria-live="polite">${escapeHTML(researchState.message)}</p>` : `<p class="visually-hidden" aria-live="polite">研究工作台已就绪</p>`}
     ${route?.runID ? `<section class="research-dossier" aria-label="研究运行详情">
@@ -11566,10 +11817,148 @@ function renderResearchWorkspace(route = getResearchRoute()) {
 }
 
 function bindResearchWorkspaceEvents(route) {
-  document.querySelector("#research-create-form")?.addEventListener("submit", createResearchRun);
+  const form = document.querySelector("#research-create-form");
+  form?.addEventListener("submit", createResearchRun);
+  form?.querySelector("[name='question']")?.addEventListener("input", () => {
+    researchState.draft = researchDraftFromForm(form);
+    scheduleResearchPreflight(researchState.draft);
+  });
+  form?.querySelectorAll("[name='mode'], [name='sources']").forEach((input) => input.addEventListener("change", () => {
+    researchState.draft = researchDraftFromForm(form);
+    scheduleResearchPreflight(researchState.draft);
+  }));
+  form?.querySelectorAll("[data-research-candidate]").forEach((input) => {
+    const select = () => {
+      const index = Number(input.dataset.researchCandidate);
+      const candidate = researchState.preflight?.candidates?.[index];
+      if (!candidate) return;
+      researchState.selectedCandidateKey = researchCandidateKey(candidate);
+      renderResearchWorkspacePreservingDraftFocus(route, input);
+    };
+    input.addEventListener("change", select);
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      input.checked = true;
+      select();
+    });
+  });
   document.querySelector("[data-research-cancel]")?.addEventListener("click", () => cancelResearchRun(route?.runID));
   document.querySelectorAll("[data-research-tab]").forEach((button) => button.addEventListener("click", () => { researchState.activeTab = button.dataset.researchTab || "evidence"; renderResearchWorkspace(route); }));
   document.querySelectorAll("[data-research-confirm-identity]").forEach((button) => button.addEventListener("click", () => confirmResearchIdentity(route?.runID, button.dataset.researchConfirmIdentity)));
+}
+
+function researchDraftFromForm(form) {
+  const data = new FormData(form);
+  return normalizeResearchDraft({
+    question: data.get("question"),
+    mode: data.get("mode"),
+    sources: data.getAll("sources"),
+    subjectIDs: researchState.draft.subjectIDs,
+    packageConstraint: researchState.draft.packageConstraint,
+    parentRunID: researchState.parentRunID || researchState.draft.parentRunID,
+  });
+}
+
+function renderResearchWorkspacePreservingDraftFocus(route, preferredElement = document.activeElement) {
+  const name = preferredElement?.name || "";
+  const value = preferredElement?.value || "";
+  const selectionStart = typeof preferredElement?.selectionStart === "number" ? preferredElement.selectionStart : null;
+  const selectionEnd = typeof preferredElement?.selectionEnd === "number" ? preferredElement.selectionEnd : null;
+  renderResearchWorkspace(route);
+  if (!name) return;
+  const next = [...document.querySelectorAll(`[name="${name}"]`)].find((element) => element.value === value) || document.querySelector(`[name="${name}"]`);
+  if (!next) return;
+  next.focus({ preventScroll: true });
+  if (selectionStart !== null && typeof next.setSelectionRange === "function") next.setSelectionRange(selectionStart, selectionEnd);
+}
+
+function markResearchPreflightPending() {
+  const status = document.querySelector("[data-research-preflight-status]");
+  if (status) status.textContent = researchState.draft.question ? "等待停笔后自动预检…" : "填写问题后自动推荐 Agent。";
+  const candidateList = document.querySelector("[data-research-candidate-list]");
+  if (candidateList) candidateList.innerHTML = `<p class="research-preflight__empty">${researchState.draft.question ? "范围已变化，等待新的候选。" : "尚未填写研究问题。"}</p>`;
+  const checkList = document.querySelector("[data-research-check-list]");
+  if (checkList) checkList.innerHTML = `<p class="research-preflight__empty">等待 Worker、来源和预算检查。</p>`;
+  const submit = document.querySelector("#research-create-form button[type='submit']");
+  if (submit) submit.disabled = true;
+}
+
+function clearResearchPreflightTimers() {
+  if (researchPreflightDebounceTimer) clearTimeout(researchPreflightDebounceTimer);
+  if (researchPreflightExpiryTimer) clearTimeout(researchPreflightExpiryTimer);
+  researchPreflightDebounceTimer = null;
+  researchPreflightExpiryTimer = null;
+}
+
+function cancelResearchPreflightLifecycle(clearSnapshot = true) {
+  clearResearchPreflightTimers();
+  researchPreflightRequestController.cancel();
+  researchState.loading.preflight = false;
+  if (!clearSnapshot) return;
+  researchState.preflight = null;
+  researchState.preflightFingerprint = "";
+  researchState.error = "";
+}
+
+function scheduleResearchPreflight(draft, delay = researchPreflightDebounceMS) {
+  const normalized = normalizeResearchDraft(draft);
+  cancelResearchPreflightLifecycle(true);
+  researchState.draft = normalized;
+  markResearchPreflightPending();
+  if (!normalized.question || getResearchRoute()?.runID) return;
+  researchPreflightDebounceTimer = window.setTimeout(() => {
+    researchPreflightDebounceTimer = null;
+    requestResearchPreflight(normalized);
+  }, delay);
+}
+
+function scheduleResearchPreflightExpiry(preflight, fingerprint) {
+  if (researchPreflightExpiryTimer) clearTimeout(researchPreflightExpiryTimer);
+  researchPreflightExpiryTimer = null;
+  const expiresAt = Date.parse(String(preflight?.expires_at || ""));
+  if (!Number.isFinite(expiresAt)) return;
+  const delay = Math.max(0, Math.min(expiresAt - Date.now() + 25, 2147483647));
+  researchPreflightExpiryTimer = window.setTimeout(() => {
+    researchPreflightExpiryTimer = null;
+    if (researchState.preflight?.preflight_id !== preflight.preflight_id || researchState.preflightFingerprint !== fingerprint) return;
+    researchState.message = "本次预检已过期，正在刷新运行条件。";
+    scheduleResearchPreflight(researchState.draft, 0);
+  }, delay);
+}
+
+async function requestResearchPreflight(draft) {
+  const normalized = normalizeResearchDraft(draft);
+  if (!normalized.question || getResearchRoute()?.runID) return;
+  const fingerprint = researchDraftFingerprint(normalized);
+  const request = researchPreflightRequestController.begin(fingerprint);
+  researchState.loading.preflight = true;
+  researchState.error = "";
+  renderResearchWorkspacePreservingDraftFocus({ runID: "" });
+  const preflightRequest = {
+    mode: normalized.mode,
+    question: normalized.question,
+    requested_sources: normalized.sources,
+    subject_ids: normalized.subjectIDs,
+  };
+  if (normalized.packageConstraint) preflightRequest.package_constraint = normalized.packageConstraint;
+  if (normalized.parentRunID) preflightRequest.parent_run_id = normalized.parentRunID;
+  try {
+    const payload = await apiFetch("/api/research/preflight", { method: "POST", signal: request.signal, body: JSON.stringify(preflightRequest) });
+    if (!applyResearchPreflightResponse(researchState, researchPreflightRequestController, request, payload, researchState.draft)) return;
+    scheduleResearchPreflightExpiry(researchState.preflight, fingerprint);
+  } catch (error) {
+    if (error?.name === "AbortError" || !researchPreflightRequestController.isCurrent(request.sequence, request.fingerprint)) return;
+    researchState.preflight = null;
+    researchState.preflightFingerprint = "";
+    researchState.selectedCandidateKey = "";
+    researchState.error = researchPreflightErrorMessage(error);
+  } finally {
+    if (researchPreflightRequestController.isCurrent(request.sequence, request.fingerprint) && researchDraftFingerprint(researchState.draft) === fingerprint && !getResearchRoute()?.runID) {
+      researchState.loading.preflight = false;
+      renderResearchWorkspacePreservingDraftFocus({ runID: "" });
+    }
+  }
 }
 
 function researchRequestID() {
@@ -11578,12 +11967,10 @@ function researchRequestID() {
 
 async function createResearchRun(event) {
   event.preventDefault();
-  const data = new FormData(event.currentTarget);
-  const sources = data.getAll("sources").map(String);
-  researchState.draft = { question: String(data.get("question") || "").trim(), mode: String(data.get("mode") || "auto"), sources: sources.length ? sources : ["knowledge"], packageID: String(data.get("package_id") || "").trim(), packageVersion: String(data.get("package_version") || "").trim() };
-  const validationMessage = validateResearchCreateDraft(researchState.draft);
-  if (validationMessage) {
-    researchState.message = validationMessage;
+  researchState.draft = researchDraftFromForm(event.currentTarget);
+  const submission = prepareResearchRunSubmission(researchState.draft, researchState);
+  if (submission.blockReason || !submission.payload) {
+    researchState.message = submission.blockReason;
     renderResearchWorkspace({ runID: "" });
     return;
   }
@@ -11591,10 +11978,7 @@ async function createResearchRun(event) {
   researchState.message = "正在建立受控研究运行…";
   renderResearchWorkspace({ runID: "" });
   try {
-    const runRequest = { mode: researchState.draft.mode, question: researchState.draft.question, requested_sources: researchState.draft.sources };
-    if (researchState.draft.packageID) runRequest.package_id = researchState.draft.packageID;
-    if (researchState.draft.packageVersion) runRequest.package_version = researchState.draft.packageVersion;
-    const payload = await apiFetch("/api/research/runs", { method: "POST", headers: { "Idempotency-Key": `research-ui:${researchRequestID()}` }, body: JSON.stringify(runRequest) });
+    const payload = await apiFetch("/api/research/runs", { method: "POST", headers: { "Idempotency-Key": `research-ui:${researchRequestID()}` }, body: JSON.stringify(submission.payload) });
     const runID = payload?.run?.run_id;
     if (!runID) throw new Error("服务器未返回研究运行 ID");
     rememberResearchRun(runID);
@@ -11603,6 +11987,10 @@ async function createResearchRun(event) {
     await boot();
   } catch (error) {
     researchState.message = researchCreateErrorMessage(error);
+    const code = String(error?.message || error || "");
+    if (["preflight_required", "research_preflight_not_found", "research_preflight_expired", "preflight_expired", "package_changed", "readiness_changed", "preflight_blocked", "research_preflight_conflict"].includes(code)) {
+      scheduleResearchPreflight(researchState.draft, 0);
+    }
     renderResearchWorkspace({ runID: "" });
   } finally {
     researchState.loading.create = false;
@@ -11732,6 +12120,7 @@ async function boot() {
   const researchRoute = getResearchRoute(routePathname);
   if (!researchRoute) {
     researchListRequestController.cancel();
+    cancelResearchPreflightLifecycle(true);
     clearResearchRunDetail();
 	}
   if (!routePathname.startsWith(`${ROUTES.knowledgeCollections}/`)) {
@@ -11781,15 +12170,17 @@ async function boot() {
     return;
   }
   if (researchRoute) {
-    if (researchRoute.packageID) researchState.draft.packageID = researchRoute.packageID;
-    if (researchRoute.packageVersion) researchState.draft.packageVersion = researchRoute.packageVersion;
     if (researchRoute.runID) {
+      cancelResearchPreflightLifecycle(true);
       if (researchState.detail?.run?.run_id !== researchRoute.runID) clearResearchRunDetail(researchRoute.runID);
       renderResearchWorkspace(researchRoute);
       await Promise.all([loadResearchRun(researchRoute.runID), pollResearchEvents(researchRoute.runID)]);
     } else {
+      if (researchRoute.packageID) researchState.draft.packageConstraint = researchRoute.packageID;
+      else delete researchState.draft.packageConstraint;
       clearResearchRunDetail();
       renderResearchWorkspace(researchRoute);
+      if (researchState.draft.question && !researchState.preflight && !researchState.loading.preflight) scheduleResearchPreflight(researchState.draft, 0);
       await loadRecentResearchRuns();
     }
     return;

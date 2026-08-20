@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -8,40 +9,56 @@ const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
+function functionSource(name) {
+  const start = js.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `Research workspace should define ${name}`);
+  const bodyStart = js.indexOf("{", start);
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = bodyStart; index < js.length; index += 1) {
+    const character = js[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote) {
+      if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+      continue;
+    }
+    if (character === "{") depth += 1;
+    if (character === "}") {
+      depth -= 1;
+      if (depth === 0) return js.slice(start, index + 1);
+    }
+  }
+  assert.fail(`Could not extract ${name}`);
+}
+
+function loadFunctions(names, context = {}) {
+  const sandbox = vm.createContext({ ...context });
+  vm.runInContext(`${names.map(functionSource).join("\n")}\nthis.result = { ${names.join(", ")} };`, sandbox);
+  return sandbox.result;
+}
+
 for (const marker of [
-  'research: "/research"',
-  "getResearchRoute",
-  "renderResearchWorkspace",
-  "loadResearchRun",
-  "pollResearchEvents",
-  "createResearchRun",
-  "cancelResearchRun",
-  "confirmResearchIdentity",
-  "研究工作台",
-  "快速检索",
-  "自动判断",
-  "深度研究",
-  "知识库",
-  "本地聊天记录",
-  "历史研究",
-  "开始研究",
-  "取消运行",
-  "检索范围",
-  "引用范围",
-  "证据",
-  "时间线",
-  "冲突",
-  "研究报告",
-  "确认身份",
-  "模型输出格式无效",
+  'research: "/research"', "getResearchRoute", "renderResearchWorkspace", "loadResearchRun",
+  "pollResearchEvents", "createResearchRun", "cancelResearchRun", "confirmResearchIdentity",
+  "研究工作台", "快速检索", "自动判断", "深度研究", "知识库", "本地聊天记录", "历史研究",
+  "开始研究", "取消运行", "检索范围", "引用范围", "证据", "时间线", "冲突", "研究报告",
+  "确认身份", "模型输出格式无效",
 ]) {
   assert.ok(js.includes(marker), `Research workspace should include ${marker}`);
 }
 
 for (const controller of [
-  "researchListRequestController",
-  "researchDetailRequestController",
-  "researchEventsRequestController",
+  "researchListRequestController", "researchDetailRequestController", "researchEventsRequestController",
+  "researchPreflightRequestController",
 ]) {
   assert.ok(js.includes(controller), `Research workspace should keep an independent ${controller}`);
 }
@@ -51,47 +68,143 @@ assert.ok(js.includes("clearResearchRunDetail"), "route changes should clear sta
 assert.ok(js.includes('headers: { "Idempotency-Key"'), "run creation should use an idempotency key");
 assert.ok(js.includes('capabilities.includes("deep_research")'), "Agent console should expose Research only for opted-in packages");
 
-const launchpad = js.match(/<form class="research-launchpad"[\s\S]*?<\/form>/)?.[0] || "";
-assert.match(launchpad, /name="package_id"[^>]*required/, "Agent Package should be required before creating a run");
-assert.match(launchpad, /name="package_version"[^>]*required/, "Agent Package version should be required before creating a run");
-assert.ok(launchpad.includes("ROUTES.agentPackages"), "Research workspace should link to Agent Package management for selection");
-assert.ok(js.includes("validateResearchCreateDraft"), "Research creation should validate the package contract before calling the API");
-assert.ok(js.includes("Agent Package 和版本为必填"), "Missing package guidance should be actionable Chinese text");
-assert.ok(js.includes("研究问题为必填"), "Custom validation should preserve the required research question contract");
-assert.ok(js.includes('"invalid_research_request"'), "Research creation should map invalid request errors");
-assert.ok(js.includes('"research_package_not_eligible"'), "Research creation should map ineligible package errors");
-const createRun = js.match(/async function createResearchRun[\s\S]*?\n\}/)?.[0] || "";
-assert.ok(createRun.indexOf("validateResearchCreateDraft") < createRun.indexOf('apiFetch("/api/research/runs"'), "Research validation should run before the create request");
+class FakeAbortController {
+  constructor() { this.signal = { aborted: false }; }
+  abort() { this.signal.aborted = true; }
+}
 
-const renderer = js.match(/function renderResearchWorkspace\([\s\S]*?\n\}/)?.[0] || "";
+const { createResearchPreflightRequestController } = loadFunctions(
+  ["createResearchPreflightRequestController"],
+  { AbortController: FakeAbortController },
+);
+const controller = createResearchPreflightRequestController();
+const firstRequest = controller.begin("first-fingerprint");
+const secondRequest = controller.begin("second-fingerprint");
+assert.equal(firstRequest.signal.aborted, true, "a newer preflight request should abort the previous request");
+assert.equal(controller.isCurrent(firstRequest.sequence, firstRequest.fingerprint), false, "an older preflight sequence must be stale");
+assert.equal(controller.isCurrent(secondRequest.sequence, secondRequest.fingerprint), true, "the newest preflight sequence and fingerprint should remain current");
+controller.cancel();
+assert.equal(secondRequest.signal.aborted, true, "route changes should abort the current preflight request");
+
+const behavior = loadFunctions([
+  "researchSourceOrder", "normalizeResearchDraft", "researchDraftFingerprint", "researchCandidateKey",
+  "selectResearchPreflightCandidate", "applyResearchPreflightResponse", "researchRunStartBlockReason",
+  "researchSelectedCandidate", "buildResearchRunRequest", "prepareResearchRunSubmission",
+]);
+const draft = behavior.normalizeResearchDraft({
+  question: "  比较两类证据  ", mode: " auto ",
+  sources: ["prior_runs", "knowledge", "knowledge"],
+  subjectIDs: ["subject-b", "subject-a", "subject-a"],
+});
+assert.deepEqual(JSON.parse(JSON.stringify(draft)), {
+  question: "比较两类证据", mode: "auto", sources: ["knowledge", "prior_runs"],
+  subjectIDs: ["subject-a", "subject-b"],
+}, "preflight and run creation should share one normalized draft");
+const fingerprint = behavior.researchDraftFingerprint(draft);
+const candidates = [
+  { package_id: "agent-one", package_version: "1.2.0", readiness: "pass" },
+  { package_id: "agent-two", package_version: "2.0.0", readiness: "warning" },
+  { package_id: "agent-three", package_version: "3.0.0", readiness: "pass" },
+  { package_id: "agent-four", package_version: "4.0.0", readiness: "pass" },
+];
+const state = { preflight: null, preflightFingerprint: "", selectedCandidateKey: "", loading: { preflight: true }, error: "" };
+const activeController = { isCurrent: (sequence, requestFingerprint) => sequence === 2 && requestFingerprint === fingerprint };
+assert.equal(
+  behavior.applyResearchPreflightResponse(state, activeController, { sequence: 1, fingerprint }, { preflight_id: "stale", candidates }, draft),
+  false, "a stale response should be ignored",
+);
+assert.equal(state.preflight, null, "a stale response must not replace the visible preflight");
+assert.equal(
+  behavior.applyResearchPreflightResponse(state, activeController, { sequence: 2, fingerprint }, { preflight_id: "fresh", status: "ready", expires_at: "2099-01-01T00:00:00Z", candidates, checks: [] }, draft),
+  true, "the current response should be accepted",
+);
+assert.equal(state.preflight.candidates.length, 3, "the UI must cap recommendation cards at three");
+assert.equal(state.selectedCandidateKey, "agent-one\u00001.2.0", "a new preflight should select the first candidate");
+state.selectedCandidateKey = "agent-two\u00002.0.0";
+behavior.applyResearchPreflightResponse(state, activeController, { sequence: 2, fingerprint }, { preflight_id: "fresh-2", status: "ready", expires_at: "2099-01-01T00:00:00Z", candidates: candidates.slice(1), checks: [] }, draft);
+assert.equal(state.selectedCandidateKey, "agent-two\u00002.0.0", "a manual selection should survive when the new candidate set still contains it");
+
+const selected = state.preflight.candidates.find((candidate) => behavior.researchCandidateKey(candidate) === state.selectedCandidateKey);
+const beforePreflight = behavior.prepareResearchRunSubmission(draft, {
+  preflight: null, preflightFingerprint: "", selectedCandidateKey: "", loading: { preflight: false },
+}, Date.parse("2026-08-20T00:00:00Z"));
+assert.equal(beforePreflight.payload, null, "run payload must not exist before a matching preflight");
+assert.equal(behavior.researchRunStartBlockReason(draft, state.preflight, state.selectedCandidateKey, fingerprint, Date.parse("2026-08-20T00:00:00Z")), "", "a fresh ready selection should allow launch");
+assert.notEqual(behavior.researchRunStartBlockReason(draft, state.preflight, state.selectedCandidateKey, fingerprint, Date.parse("2026-08-20T00:00:00Z"), true), "", "a loading preflight should disable launch");
+assert.notEqual(behavior.researchRunStartBlockReason(draft, { ...state.preflight, expires_at: "2026-08-19T00:00:00Z" }, state.selectedCandidateKey, fingerprint, Date.parse("2026-08-20T00:00:00Z")), "", "an expired preflight should disable launch");
+assert.notEqual(behavior.researchRunStartBlockReason(draft, { ...state.preflight, status: "blocked" }, state.selectedCandidateKey, fingerprint, Date.parse("2026-08-20T00:00:00Z")), "", "a blocked preflight should disable launch");
+assert.notEqual(behavior.researchRunStartBlockReason(draft, state.preflight, "", fingerprint, Date.parse("2026-08-20T00:00:00Z")), "", "missing candidate confirmation should disable launch");
+assert.notEqual(behavior.researchRunStartBlockReason(draft, state.preflight, state.selectedCandidateKey, "different-fingerprint", Date.parse("2026-08-20T00:00:00Z")), "", "a changed draft should disable a stale preflight");
+const runPayload = behavior.buildResearchRunRequest(draft, state.preflight, selected);
+assert.deepEqual(JSON.parse(JSON.stringify(runPayload)), {
+  preflight_id: "fresh-2", mode: "auto", question: "比较两类证据",
+  requested_sources: ["knowledge", "prior_runs"], subject_ids: ["subject-a", "subject-b"],
+  package_id: "agent-two", package_version: "2.0.0",
+}, "run creation should submit the exact accepted preflight and normalized scope");
+const afterPreflight = behavior.prepareResearchRunSubmission(draft, state, Date.parse("2026-08-20T00:00:00Z"));
+assert.deepEqual(JSON.parse(JSON.stringify(afterPreflight.payload)), JSON.parse(JSON.stringify(runPayload)), "the submission gate should release the exact run payload only after preflight");
+
+const debounceMatch = js.match(/const researchPreflightDebounceMS = (\d+);/);
+assert.equal(Number(debounceMatch?.[1]), 600, "preflight should wait 600ms after draft edits");
+const preflightRequest = functionSource("requestResearchPreflight");
+assert.ok(preflightRequest.includes('apiFetch("/api/research/preflight"'), "preflight should POST to the dedicated endpoint");
+assert.ok(preflightRequest.includes("request.signal"), "preflight fetch should receive the abort signal");
+assert.doesNotMatch(preflightRequest, /console\.|localStorage|URLSearchParams/, "preflight must not log or persist the research question outside the request body");
+const createRun = functionSource("createResearchRun");
+assert.ok(createRun.indexOf("prepareResearchRunSubmission") < createRun.indexOf('apiFetch("/api/research/runs"'), "run creation should enforce the tested preflight gate before calling the API");
+assert.ok(createRun.includes('["preflight_required",'), "a server-side missing-preflight response should invalidate and refresh the local snapshot");
+const boot = functionSource("boot");
+assert.ok(boot.includes("cancelResearchPreflightLifecycle"), "route changes should clear the debounce timer and abort preflight requests");
+assert.ok(boot.includes("else delete researchState.draft.packageConstraint"), "leaving a constrained deep link should not retain a hidden Package constraint");
+
+const launchpad = js.match(/<form class="research-launchpad"[\s\S]*?<\/form>/)?.[0] || "";
+assert.doesNotMatch(launchpad, /name="package_id"|name="package_version"/, "normal Research flow must not expose raw Package identity inputs");
+assert.ok(launchpad.includes("问题与范围"), "the first launch stage should name question and scope");
+const renderer = functionSource("renderResearchWorkspace");
 for (const forbidden of ["思维链", "隐藏推理", "raw worker", "Worker 原始", "私有标识符", "完整聊天导出", "Token 输入"]) {
   assert.ok(!renderer.includes(forbidden), `Research renderer must not expose ${forbidden}`);
 }
 for (const semantic of ["role=\"tablist\"", "role=\"tab\"", "aria-live=\"polite\"", "aria-label=\"研究阶段\""]) {
   assert.ok(renderer.includes(semantic), `Research renderer should include ${semantic}`);
 }
+const preflightRenderer = `${functionSource("renderResearchPreflight")}\n${functionSource("renderResearchCandidateCards")}`;
+for (const semantic of ["type=\"radio\"", "data-research-candidate", "aria-busy=", "aria-describedby=", "data-research-preflight-status"]) {
+  assert.ok(preflightRenderer.includes(semantic), `Preflight renderer should include ${semantic}`);
+}
+for (const label of ["高匹配", "中匹配", "低匹配", "匹配理由", "知识范围", "更新时间", "评测", "来源", "运行准备", "运行前检查", "Worker", "预算", "通过", "提醒", "阻断", "创建 / 补全 Agent"]) {
+  assert.ok(js.includes(label), `Research preflight should include the Chinese label ${label}`);
+}
+for (const code of [
+  "no_eligible_package", "insufficient_coverage", "worker_offline", "source_not_allowed", "budget_insufficient",
+  "invalid_research_preflight_request", "research_preflight_not_found", "research_preflight_expired",
+  "research_preflight_conflict", "research_preflight_unavailable", "preflight_required", "preflight_expired",
+  "package_changed", "readiness_changed", "preflight_blocked",
+]) {
+  assert.ok(js.includes(`\"${code}\"`), `Research preflight should map ${code} to bounded Chinese guidance`);
+}
+assert.ok(js.includes("researchPreflightErrorMessage"), "preflight errors should use a bounded presentation mapper");
+assert.doesNotMatch(functionSource("researchPreflightErrorMessage"), /\|\| code|\? code|: code/, "unknown internal preflight errors must not be displayed raw");
 
 for (const className of [
-  ".research-workspace",
-  ".research-launchpad",
-  ".research-stage-rail",
-  ".research-dossier",
-  ".research-scope-ledger",
-  ".research-tablist",
-  ".research-evidence-card",
-  ".research-failure",
+  ".research-workspace", ".research-launchpad", ".research-preflight", ".research-agent-card", ".research-checks",
+  ".research-stage-rail", ".research-dossier", ".research-scope-ledger", ".research-tablist",
+  ".research-evidence-card", ".research-failure",
 ]) {
   assert.ok(css.includes(className), `Research styles should include ${className}`);
 }
 assert.ok(css.includes("grid-template-columns: minmax(180px, 0.55fr) minmax(0, 2fr) minmax(230px, 0.72fr)"), "desktop workspace should use a dense three-column dossier layout");
 assert.ok(css.includes("overflow-wrap: anywhere"), "opaque identifiers must wrap instead of causing overflow");
+assert.ok(css.includes("fieldset input:focus-visible + span"), "hidden scope controls should expose a visible keyboard focus ring");
 const researchStyles = css.slice(css.indexOf("/* Research dossier"));
 const mobile = researchStyles.slice(researchStyles.indexOf("@media (max-width: 760px)"));
-assert.ok(mobile.includes(".research-dossier"), "mobile workspace should collapse the dossier grid");
+for (const mobileClass of [".research-launchpad", ".research-preflight", ".research-agent-list", ".research-checks", ".research-dossier"]) {
+  assert.ok(mobile.includes(mobileClass), `mobile workspace should collapse ${mobileClass}`);
+}
 assert.ok(mobile.includes("grid-template-columns: minmax(0, 1fr)"), "mobile research layout should use one bounded column");
 assert.ok(css.includes("prefers-reduced-motion: reduce"), "research motion should respect reduced motion");
-assert.ok(html.includes("20260814-research-workspace"), "Research workspace should publish fresh assets");
-assert.ok(html.includes("20260815-research-model-output"), "Research failure guidance should publish with a fresh app asset");
-assert.ok(html.includes("20260817-research-package-required"), "Required package validation should publish with a fresh app asset");
+assert.ok(html.includes("20260814-research-workspace"), "Research workspace should preserve its prior asset marker");
+assert.ok(html.includes("20260815-research-model-output"), "Research failure guidance should preserve its prior asset marker");
+assert.ok(html.includes("20260817-research-package-required"), "Required package migration should preserve the prior marker");
+assert.ok(html.includes("20260820-research-agent-preflight"), "Research preflight should publish fresh app and stylesheet assets");
 
 console.log("Research workspace smoke passed");
