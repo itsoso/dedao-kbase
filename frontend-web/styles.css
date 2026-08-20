@@ -8221,6 +8221,9 @@ body.has-proofroom-modal {
 .research-preflight__blocked strong { font-size: 12px; }
 .research-preflight__blocked ul { flex: 1; margin: 0; padding-left: 17px; color: #6b4f48; font-size: 10px; }
 .research-preflight__blocked .button { flex: 0 0 auto; }
+.research-preflight__notice { display: flex; align-items: center; gap: 12px; margin-top: 10px; border-left: 4px solid #a86f16; padding: 8px 10px; background: #f7f0df; }
+.research-preflight__notice strong { flex: 0 0 auto; font-size: 12px; }
+.research-preflight__notice ul { flex: 1; margin: 0; padding-left: 17px; color: #675c42; font-size: 10px; }
 .research-preflight > footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 11px; border-top: 1px solid var(--research-line); padding-top: 10px; }
 .research-preflight > footer p { margin: 0; color: #657168; font-size: 11px; text-align: right; }
 .research-preflight > footer .button { min-width: 118px; }
@@ -8485,6 +8488,7 @@ body.has-proofroom-modal {
   .research-preflight > header,
   .research-preflight__section-title,
   .research-preflight__blocked,
+  .research-preflight__notice,
   .research-preflight > footer { align-items: stretch; flex-direction: column; }
   .research-preflight > header p,
   .research-preflight > footer p { max-width: none; text-align: left; }

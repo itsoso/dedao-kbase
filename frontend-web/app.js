@@ -11541,6 +11541,14 @@ function researchSelectedCandidate(preflight, selectedCandidateKey) {
     .find((candidate) => researchCandidateKey(candidate) === selectedCandidateKey) || null;
 }
 
+function researchPreflightNotice(preflight, selectedCandidateKey) {
+  const selected = researchSelectedCandidate(preflight, selectedCandidateKey);
+  return {
+    hardBlocked: preflight?.status === "blocked" || selected?.readiness === "blocked",
+    gaps: Array.isArray(preflight?.gaps) ? preflight.gaps : [],
+  };
+}
+
 function researchRunStartBlockReason(draft, preflight, selectedCandidateKey, preflightFingerprint, now = Date.now(), loading = false) {
   const normalized = normalizeResearchDraft(draft);
   if (!normalized.question) return "请先填写研究问题。";
@@ -11624,7 +11632,15 @@ function researchReasonLabel(value) {
 }
 
 function researchSourceLabel(value) {
-  return ({ knowledge: "知识库", chatlog: "本地聊天记录", prior_runs: "历史研究" })[value] || "其他受控来源";
+  return ({
+    knowledge: "知识库",
+    chatlog: "本地聊天记录",
+    prior_runs: "历史研究",
+    wechat_mp_article: "微信公众号文章",
+    wcplus_wechat_article: "微信公众号文章",
+    dedao_ebook: "得到电子书",
+    dedao_course_article: "得到课程文章",
+  })[value] || "其他受控来源";
 }
 
 function researchEvaluationLabel(value) {
@@ -11759,7 +11775,7 @@ function renderResearchPreflight() {
     researchState.draft, preflight, researchState.selectedCandidateKey,
     researchState.preflightFingerprint, Date.now(), loading,
   );
-  const gaps = Array.isArray(preflight?.gaps) ? preflight.gaps : [];
+  const notice = researchPreflightNotice(preflight, researchState.selectedCandidateKey);
   const statusText = loading
     ? "正在匹配 Agent 并检查运行条件…"
     : researchState.error
@@ -11775,7 +11791,7 @@ function renderResearchPreflight() {
       <section aria-labelledby="research-candidates-title"><div class="research-preflight__section-title"><span>候选</span><h3 id="research-candidates-title">最多三项，默认首选</h3></div><div data-research-candidate-list>${loading ? `<p class="research-preflight__empty">正在按知识覆盖与评测排序…</p>` : renderResearchCandidateCards(preflight)}</div></section>
       <section aria-labelledby="research-checks-title"><div class="research-preflight__section-title"><span>检查</span><h3 id="research-checks-title">运行前检查</h3></div><div data-research-check-list>${loading ? `<p class="research-preflight__empty">正在检查 Worker、来源与预算…</p>` : renderResearchChecks(preflight)}</div></section>
     </div>
-    ${preflight?.status === "blocked" || gaps.length ? `<aside class="research-preflight__blocked" role="alert"><strong>当前不能开始研究</strong><ul>${gaps.length ? gaps.map((gap) => `<li>${escapeHTML(researchGapLabel(gap.code))}</li>`).join("") : "<li>请处理阻断项后重新预检。</li>"}</ul><a class="button button-ghost" href="${escapeAttribute(ROUTES.agentPackages)}">创建 / 补全 Agent</a></aside>` : ""}
+    ${notice.hardBlocked ? `<aside class="research-preflight__blocked" role="alert"><strong>当前不能开始研究</strong><ul>${notice.gaps.length ? notice.gaps.map((gap) => `<li>${escapeHTML(researchGapLabel(gap.code))}</li>`).join("") : "<li>请处理阻断项后重新预检。</li>"}</ul><a class="button button-ghost" href="${escapeAttribute(ROUTES.agentPackages)}">创建 / 补全 Agent</a></aside>` : notice.gaps.length ? `<aside class="research-preflight__notice" role="status"><strong>运行提醒</strong><ul>${notice.gaps.map((gap) => `<li>${escapeHTML(researchGapLabel(gap.code))}</li>`).join("")}</ul></aside>` : ""}
     <footer><p id="research-start-guidance">${escapeHTML(blockReason || "预检有效，确认所选 Agent 后即可开始。")}</p><button class="button button-primary" type="submit" ${blockReason || researchState.loading.create ? "disabled" : ""} aria-describedby="research-start-guidance">${researchState.loading.create ? "正在创建…" : "开始研究"}</button></footer>
   </section>`;
 }
@@ -11965,6 +11981,14 @@ function researchRequestID() {
   return window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+async function postResearchRunSubmission(payload) {
+  return apiFetch("/api/research/runs", {
+    method: "POST",
+    headers: { "Idempotency-Key": `research-ui:${researchRequestID()}` },
+    body: JSON.stringify(payload),
+  });
+}
+
 async function createResearchRun(event) {
   event.preventDefault();
   researchState.draft = researchDraftFromForm(event.currentTarget);
@@ -11978,7 +12002,7 @@ async function createResearchRun(event) {
   researchState.message = "正在建立受控研究运行…";
   renderResearchWorkspace({ runID: "" });
   try {
-    const payload = await apiFetch("/api/research/runs", { method: "POST", headers: { "Idempotency-Key": `research-ui:${researchRequestID()}` }, body: JSON.stringify(submission.payload) });
+    const payload = await postResearchRunSubmission(submission.payload);
     const runID = payload?.run?.run_id;
     if (!runID) throw new Error("服务器未返回研究运行 ID");
     rememberResearchRun(runID);

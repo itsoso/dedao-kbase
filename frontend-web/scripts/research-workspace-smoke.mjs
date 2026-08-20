@@ -10,8 +10,9 @@ const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 function functionSource(name) {
-  const start = js.indexOf(`function ${name}(`);
-  assert.notEqual(start, -1, `Research workspace should define ${name}`);
+  const functionStart = js.indexOf(`function ${name}(`);
+  assert.notEqual(functionStart, -1, `Research workspace should define ${name}`);
+  const start = js.slice(Math.max(0, functionStart - 6), functionStart) === "async " ? functionStart - 6 : functionStart;
   const bodyStart = js.indexOf("{", start);
   let depth = 0;
   let quote = "";
@@ -89,7 +90,7 @@ assert.equal(secondRequest.signal.aborted, true, "route changes should abort the
 const behavior = loadFunctions([
   "researchSourceOrder", "normalizeResearchDraft", "researchDraftFingerprint", "researchCandidateKey",
   "selectResearchPreflightCandidate", "applyResearchPreflightResponse", "researchRunStartBlockReason",
-  "researchSelectedCandidate", "buildResearchRunRequest", "prepareResearchRunSubmission",
+  "researchSelectedCandidate", "researchPreflightNotice", "researchSourceLabel", "buildResearchRunRequest", "prepareResearchRunSubmission",
 ]);
 const draft = behavior.normalizeResearchDraft({
   question: "  比较两类证据  ", mode: " auto ",
@@ -124,6 +125,36 @@ state.selectedCandidateKey = "agent-two\u00002.0.0";
 behavior.applyResearchPreflightResponse(state, activeController, { sequence: 2, fingerprint }, { preflight_id: "fresh-2", status: "ready", expires_at: "2099-01-01T00:00:00Z", candidates: candidates.slice(1), checks: [] }, draft);
 assert.equal(state.selectedCandidateKey, "agent-two\u00002.0.0", "a manual selection should survive when the new candidate set still contains it");
 
+const mixedPreflight = {
+  ...state.preflight,
+  status: "ready",
+  gaps: [{ code: "budget_insufficient" }],
+  candidates: [
+    { package_id: "agent-two", package_version: "2.0.0", readiness: "warning" },
+    { package_id: "agent-blocked", package_version: "1.0.0", readiness: "blocked" },
+  ],
+};
+assert.deepEqual(
+  JSON.parse(JSON.stringify(behavior.researchPreflightNotice(mixedPreflight, "agent-two\u00002.0.0"))),
+  { hardBlocked: false, gaps: [{ code: "budget_insufficient" }] },
+  "mixed candidates and budget warnings should render as reminders when the selected Agent can run",
+);
+assert.equal(
+  behavior.researchPreflightNotice(mixedPreflight, "agent-blocked\u00001.0.0").hardBlocked,
+  true,
+  "selecting a blocked Agent should render the hard-blocked treatment",
+);
+assert.equal(
+  behavior.researchPreflightNotice({ ...mixedPreflight, status: "blocked" }, "agent-two\u00002.0.0").hardBlocked,
+  true,
+  "an overall blocked preflight should render the hard-blocked treatment",
+);
+assert.deepEqual(
+  ["wechat_mp_article", "wcplus_wechat_article", "dedao_ebook", "dedao_course_article", "future_private_source"].map(behavior.researchSourceLabel),
+  ["微信公众号文章", "微信公众号文章", "得到电子书", "得到课程文章", "其他受控来源"],
+  "Retrieval Policy source types should use stable Chinese labels without exposing unknown internal values",
+);
+
 const selected = state.preflight.candidates.find((candidate) => behavior.researchCandidateKey(candidate) === state.selectedCandidateKey);
 const beforePreflight = behavior.prepareResearchRunSubmission(draft, {
   preflight: null, preflightFingerprint: "", selectedCandidateKey: "", loading: { preflight: false },
@@ -144,6 +175,56 @@ assert.deepEqual(JSON.parse(JSON.stringify(runPayload)), {
 const afterPreflight = behavior.prepareResearchRunSubmission(draft, state, Date.parse("2026-08-20T00:00:00Z"));
 assert.deepEqual(JSON.parse(JSON.stringify(afterPreflight.payload)), JSON.parse(JSON.stringify(runPayload)), "the submission gate should release the exact run payload only after preflight");
 
+async function executeCreateResearchRun(initialState) {
+  const requests = [];
+  const runtimeState = JSON.parse(JSON.stringify(initialState));
+  const runtime = loadFunctions([
+    "researchSourceOrder", "normalizeResearchDraft", "researchDraftFingerprint", "researchCandidateKey",
+    "researchSelectedCandidate", "researchRunStartBlockReason", "buildResearchRunRequest",
+    "prepareResearchRunSubmission", "postResearchRunSubmission", "createResearchRun",
+  ], {
+    researchState: runtimeState,
+    researchDraftFromForm: () => draft,
+    apiFetch: async (url, options) => {
+      requests.push({ url, method: options?.method, body: JSON.parse(options?.body || "null") });
+      return { run: { run_id: "run-created" } };
+    },
+    researchRequestID: () => "request-fixed",
+    renderResearchWorkspace: () => {},
+    rememberResearchRun: () => {},
+    window: { history: { pushState: () => {} } },
+    buildResearchRunURL: (runID) => `/research/${runID}`,
+    clearResearchRunDetail: () => {},
+    boot: async () => {},
+    researchCreateErrorMessage: () => "创建失败",
+    scheduleResearchPreflight: () => {},
+    getResearchRoute: () => null,
+  });
+  await runtime.createResearchRun({ preventDefault() {}, currentTarget: {} });
+  return { requests, state: runtimeState };
+}
+
+const missingPreflightExecution = await executeCreateResearchRun({
+  preflight: null, preflightFingerprint: "", selectedCandidateKey: "",
+  loading: { preflight: false, create: false }, message: "", draft,
+});
+assert.equal(missingPreflightExecution.requests.filter(({ url }) => url === "/api/research/runs").length, 0, "submitting without a valid preflight must not POST a run");
+
+const blockedExecution = await executeCreateResearchRun({
+  preflight: { ...state.preflight, status: "blocked" }, preflightFingerprint: fingerprint,
+  selectedCandidateKey: state.selectedCandidateKey, loading: { preflight: false, create: false }, message: "", draft,
+});
+assert.equal(blockedExecution.requests.filter(({ url }) => url === "/api/research/runs").length, 0, "submitting a blocked preflight must not POST a run");
+
+const readyExecution = await executeCreateResearchRun({
+  preflight: state.preflight, preflightFingerprint: fingerprint,
+  selectedCandidateKey: state.selectedCandidateKey, loading: { preflight: false, create: false }, message: "", draft,
+});
+const runRequests = readyExecution.requests.filter(({ url }) => url === "/api/research/runs");
+assert.equal(runRequests.length, 1, "a ready confirmed preflight should POST exactly one run");
+assert.equal(runRequests[0].method, "POST", "the ready submission should use POST for run creation");
+assert.deepEqual(JSON.parse(JSON.stringify(runRequests[0].body)), JSON.parse(JSON.stringify(runPayload)), "the executed run POST should preserve the exact preflight-bound normalized payload");
+
 const debounceMatch = js.match(/const researchPreflightDebounceMS = (\d+);/);
 assert.equal(Number(debounceMatch?.[1]), 600, "preflight should wait 600ms after draft edits");
 const preflightRequest = functionSource("requestResearchPreflight");
@@ -151,7 +232,8 @@ assert.ok(preflightRequest.includes('apiFetch("/api/research/preflight"'), "pref
 assert.ok(preflightRequest.includes("request.signal"), "preflight fetch should receive the abort signal");
 assert.doesNotMatch(preflightRequest, /console\.|localStorage|URLSearchParams/, "preflight must not log or persist the research question outside the request body");
 const createRun = functionSource("createResearchRun");
-assert.ok(createRun.indexOf("prepareResearchRunSubmission") < createRun.indexOf('apiFetch("/api/research/runs"'), "run creation should enforce the tested preflight gate before calling the API");
+assert.ok(createRun.indexOf("prepareResearchRunSubmission") < createRun.indexOf("postResearchRunSubmission"), "run creation should enforce the tested preflight gate before calling the API");
+assert.doesNotMatch(createRun, /apiFetch\(/, "run creation should cross the mockable run-submission boundary after its gate");
 assert.ok(createRun.includes('["preflight_required",'), "a server-side missing-preflight response should invalidate and refresh the local snapshot");
 const boot = functionSource("boot");
 assert.ok(boot.includes("cancelResearchPreflightLifecycle"), "route changes should clear the debounce timer and abort preflight requests");
@@ -168,6 +250,7 @@ for (const semantic of ["role=\"tablist\"", "role=\"tab\"", "aria-live=\"polite\
   assert.ok(renderer.includes(semantic), `Research renderer should include ${semantic}`);
 }
 const preflightRenderer = `${functionSource("renderResearchPreflight")}\n${functionSource("renderResearchCandidateCards")}`;
+assert.ok(preflightRenderer.includes("researchPreflightNotice"), "the visible preflight treatment should use the tested mixed-candidate notice classification");
 for (const semantic of ["type=\"radio\"", "data-research-candidate", "aria-busy=", "aria-describedby=", "data-research-preflight-status"]) {
   assert.ok(preflightRenderer.includes(semantic), `Preflight renderer should include ${semantic}`);
 }
