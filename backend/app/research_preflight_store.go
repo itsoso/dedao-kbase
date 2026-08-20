@@ -77,6 +77,51 @@ func (s *ResearchStore) ReplayConfirmedResearchRun(
 		return nil, false, fmt.Errorf("route_reasons must contain 1 to %d items", researchRouteReasonsMax)
 	}
 	preflightID := input.Request.PreflightID
+	expectedHash, err := hashResearchRunInput(input)
+	if err != nil {
+		return nil, false, err
+	}
+	var replayRunID, storedHash, storedPreflightID string
+	err = s.db.QueryRow(`SELECT runs.run_id, runs.request_hash, runs.preflight_id
+		FROM research_runs AS runs
+		JOIN research_http_owners AS owners ON owners.run_id = runs.run_id
+		WHERE runs.idempotency_key = ? AND owners.owner_hash = ?`,
+		input.IdempotencyKey, ownerHash).Scan(&replayRunID, &storedHash, &storedPreflightID)
+	if err == nil {
+		if storedPreflightID != preflightID || storedHash != expectedHash {
+			return nil, false, ErrResearchRunIdempotencyConflict
+		}
+		run, loadErr := loadResearchRun(s.db, replayRunID)
+		if loadErr != nil {
+			return nil, false, classifyResearchPreflightStoreError("decode durable research run replay", loadErr)
+		}
+		if run.PreflightID != preflightID {
+			return nil, false, corruptResearchPreflightError("validate durable research run replay binding", nil)
+		}
+		return run, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, classifyResearchPreflightStoreError("load durable research run replay", err)
+	}
+
+	var boundOwnerHash string
+	err = s.db.QueryRow(`SELECT COALESCE(owners.owner_hash, '')
+		FROM research_runs AS runs
+		LEFT JOIN research_http_owners AS owners ON owners.run_id = runs.run_id
+		WHERE runs.preflight_id = ?`, preflightID).Scan(&boundOwnerHash)
+	if err == nil {
+		if err := validateResearchPreflightOwnerHash(boundOwnerHash); err != nil {
+			return nil, false, corruptResearchPreflightError("validate durable preflight binding owner", err)
+		}
+		if boundOwnerHash != ownerHash {
+			return nil, false, ErrResearchPreflightNotFound
+		}
+		return nil, false, ErrResearchPreflightConsumed
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, classifyResearchPreflightStoreError("load durable preflight binding", err)
+	}
+
 	record, err := queryResearchPreflightRecord(s.db, preflightID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, ErrResearchPreflightNotFound
@@ -106,9 +151,9 @@ func (s *ResearchStore) ReplayConfirmedResearchRun(
 	if !validResearchPreflightResourceID(record.boundRunID) || len([]rune(record.boundRunID)) > researchPackageIDMaxRunes {
 		return nil, false, corruptResearchPreflightError("validate authority precheck bound run", nil)
 	}
-	var existingKey, storedHash string
+	var existingKey, boundStoredHash string
 	if err := s.db.QueryRow(`SELECT idempotency_key, request_hash FROM research_runs WHERE run_id = ?`,
-		record.boundRunID).Scan(&existingKey, &storedHash); errors.Is(err, sql.ErrNoRows) {
+		record.boundRunID).Scan(&existingKey, &boundStoredHash); errors.Is(err, sql.ErrNoRows) {
 		return nil, false, corruptResearchPreflightError("authority precheck bound run is missing", err)
 	} else if err != nil {
 		return nil, false, classifyResearchPreflightStoreError("load authority precheck bound run", err)
@@ -116,11 +161,7 @@ func (s *ResearchStore) ReplayConfirmedResearchRun(
 	if existingKey != input.IdempotencyKey {
 		return nil, false, ErrResearchPreflightConsumed
 	}
-	expectedHash, err := hashResearchRunInput(input)
-	if err != nil {
-		return nil, false, err
-	}
-	if expectedHash != storedHash {
+	if expectedHash != boundStoredHash {
 		return nil, false, ErrResearchRunIdempotencyConflict
 	}
 	run, err := loadResearchRun(s.db, record.boundRunID)

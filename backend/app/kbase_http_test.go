@@ -3111,6 +3111,24 @@ func TestKBaseHTTPResearchRunPreflightAuthorityRejectsBeforePackageIO(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
+		foreignRequest := ResearchRunRequest{
+			PreflightID: preflight.PreflightID, Mode: ResearchModeDeep, Question: "authority foreign evidence",
+			PackageID: pkg.PackageID, PackageVersion: pkg.Version, RequestedSources: []string{ResearchSourceChatlog},
+		}
+		if run, created, err := research.ConfirmResearchRun(ResearchRunConfirmation{
+			OwnerHash: testResearchPreflightOwnerB,
+			Input: ResearchRunInput{
+				IdempotencyKey: "authority-foreign-bound", Request: foreignRequest, Mode: ResearchModeDeep,
+				RouteReasons: []string{ResearchRouteExplicitDeep}, Budget: preflight.Candidates[0].Budget.Limits,
+			},
+			SelectedCandidate: preflight.Candidates[0],
+		}); err != nil || !created || run == nil {
+			t.Fatalf("bind foreign preflight run=%#v created=%v error=%v", run, created, err)
+		}
+		research.now = func() time.Time { return now.Add(researchPreflightStoreTTL + time.Second) }
+		if deleted, err := research.DeleteExpiredResearchPreflights(researchPreflightCleanupMax); err != nil || deleted != 1 {
+			t.Fatalf("cleanup foreign preflight deleted=%d error=%v", deleted, err)
+		}
 		handler := NewKBaseHTTPHandler(researchPreflightHTTPTestConfig(knowledge, research, source))
 		loads := 0
 		workerChecks := 0
@@ -3137,7 +3155,7 @@ func TestKBaseHTTPResearchRunPreflightAuthorityRejectsBeforePackageIO(t *testing
 		if response.Code != http.StatusNotFound || response.Body.String() != "{\"error\":\"research_preflight_not_found\"}\n" || loads != 0 || workerChecks != 0 {
 			t.Fatalf("status=%d body=%s artifact_loads=%d worker_checks=%d bearer_owner=%s", response.Code, response.Body.String(), loads, workerChecks, bearerOwner)
 		}
-		assertResearchRunCount(t, research, 0)
+		assertResearchRunCount(t, research, 1)
 	})
 
 	t.Run("consumed with new key", func(t *testing.T) {
@@ -3175,6 +3193,10 @@ func TestKBaseHTTPResearchRunPreflightAuthorityRejectsBeforePackageIO(t *testing
 		if created := create("authority-consumed-first"); created.Code != http.StatusCreated {
 			t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
 		}
+		research.now = func() time.Time { return now.Add(researchPreflightStoreTTL + time.Second) }
+		if deleted, err := research.DeleteExpiredResearchPreflights(researchPreflightCleanupMax); err != nil || deleted != 1 {
+			t.Fatalf("cleanup deleted=%d error=%v", deleted, err)
+		}
 		loads := 0
 		workerChecks := 0
 		previous := agentPackageArtifactLoadHook
@@ -3189,6 +3211,10 @@ func TestKBaseHTTPResearchRunPreflightAuthorityRejectsBeforePackageIO(t *testing
 			return os.ErrPermission
 		}
 		t.Cleanup(func() { researchPreflightWorkerReadinessHook = previousWorker })
+		replayed := create("authority-consumed-first")
+		if replayed.Code != http.StatusOK || loads != 0 || workerChecks != 0 {
+			t.Fatalf("replay status=%d body=%s artifact_loads=%d worker_checks=%d", replayed.Code, replayed.Body.String(), loads, workerChecks)
+		}
 		consumed := create("authority-consumed-second")
 		if consumed.Code != http.StatusConflict || consumed.Body.String() != "{\"error\":\"research_preflight_conflict\"}\n" || loads != 0 || workerChecks != 0 {
 			t.Fatalf("consumed status=%d body=%s artifact_loads=%d worker_checks=%d", consumed.Code, consumed.Body.String(), loads, workerChecks)

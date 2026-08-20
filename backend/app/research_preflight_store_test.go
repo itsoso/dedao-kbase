@@ -587,6 +587,55 @@ func TestResearchRunRequiresPreflightBoundReplaySurvivesExpiryWithoutRenewingSna
 	}
 }
 
+func TestResearchRunRequiresPreflightBoundReplaySurvivesExpiryCleanup(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	store, err := OpenResearchStore(t.TempDir(), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	confirmation := saveResearchRunConfirmationPreflight(t, store, "")
+	created, wasCreated, err := store.ConfirmResearchRun(confirmation)
+	if err != nil || !wasCreated {
+		t.Fatalf("create=%#v created=%v error=%v", created, wasCreated, err)
+	}
+	unbound := testResearchPreflight()
+	unbound.PreflightID = "research-preflight-expired-unbound"
+	if _, err := store.SaveResearchPreflight(testResearchPreflightOwnerA, testResearchPreflightStoreRequest(), unbound, researchPreflightStoreTTL); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(researchPreflightStoreTTL + time.Second)
+	deleted, err := store.DeleteExpiredResearchPreflights(researchPreflightCleanupMax)
+	if err != nil || deleted != 2 {
+		t.Fatalf("cleanup deleted=%d error=%v", deleted, err)
+	}
+	replayInput := confirmation.Input
+	replayInput.Mode = ResearchModeDeep
+	replayInput.RouteReasons = []string{ResearchRouteConflict, ResearchRouteCrossSource}
+	replayInput.Budget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 16000, MaxModelCalls: 8, MaxCostUSD: 2}
+	replayed, found, err := store.ReplayConfirmedResearchRun(confirmation.OwnerHash, replayInput)
+	if err != nil || !found || replayed.RunID != created.RunID {
+		t.Fatalf("cleanup replay=%#v found=%v error=%v", replayed, found, err)
+	}
+	changedClient := replayInput
+	changedClient.Request.Question = "changed after cleanup"
+	if replayed, found, err := store.ReplayConfirmedResearchRun(confirmation.OwnerHash, changedClient); replayed != nil || found || !errors.Is(err, ErrResearchRunIdempotencyConflict) {
+		t.Fatalf("cleanup changed client replay=%#v found=%v error=%v", replayed, found, err)
+	}
+	newKey := replayInput
+	newKey.IdempotencyKey = "confirmation-after-cleanup-new-key"
+	if replayed, found, err := store.ReplayConfirmedResearchRun(confirmation.OwnerHash, newKey); replayed != nil || found || !errors.Is(err, ErrResearchPreflightConsumed) {
+		t.Fatalf("cleanup consumed replay=%#v found=%v error=%v", replayed, found, err)
+	}
+	if replayed, found, err := store.ReplayConfirmedResearchRun(testResearchPreflightOwnerB, newKey); replayed != nil || found || !errors.Is(err, ErrResearchPreflightNotFound) {
+		t.Fatalf("cleanup foreign replay=%#v found=%v error=%v", replayed, found, err)
+	}
+	if _, err := store.LoadResearchPreflightForOwner(unbound.PreflightID, testResearchPreflightOwnerA); !errors.Is(err, ErrResearchPreflightNotFound) {
+		t.Fatalf("expired unbound preflight remained after cleanup: %v", err)
+	}
+}
+
 func TestResearchRunRequiresPreflightReplayIgnoresDerivedDecisionDrift(t *testing.T) {
 	store := openResearchRunConfirmationStore(t)
 	confirmation := saveResearchRunConfirmationPreflight(t, store, "")
