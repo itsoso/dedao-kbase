@@ -172,8 +172,11 @@ jobs:
             'RemainAfterExit=yes' |
             sudo tee /etc/systemd/system/dedao-kbase.service >/dev/null
           systemd-analyze verify deploy/systemd/dedao-book-job-worker.service
-          systemd-analyze verify \
-            deploy/systemd/dedao-evolution-worker@.service
+          for worker in agent-evolution-worker knowledge-evolution-worker evaluation-worker; do
+            unit="$RUNNER_TEMP/dedao-evolution-worker@${worker}.service"
+            cp deploy/systemd/dedao-evolution-worker@.service "$unit"
+            systemd-analyze verify "$unit"
+          done
 
       - name: Test real Nginx proxy
         run: |
