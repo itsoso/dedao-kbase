@@ -124,7 +124,7 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 		existingPackage = existing
 		createdAt = existing.Book.CreatedAt
 		if document.ContentHash == contentHash {
-			if sourceArticleMetadataChanged(existing.Book, normalized) {
+			if sourceArticleMetadataChanged(existing.Book, normalized) || sourceCoverageChanged(existing, normalized) {
 				outcome = SourceItemUpdated
 				metadataOnly = true
 			} else {
@@ -141,15 +141,26 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 		if metadataOnly {
 			pkg = updateSourceArticlePackageMetadata(*existingPackage, normalized, acceptedAt)
 		}
+		analysisHash := contentHash
+		resetAnalysis := !metadataOnly
+		if normalized.Metadata["hash_strategy"] == "canonical_package" {
+			packageHash, hashErr := BookKnowledgeContentHash(pkg)
+			if hashErr != nil {
+				return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized, hashErr)
+			}
+			resetAnalysis = resetAnalysis || pkg.Book.ContentHash != packageHash
+			pkg.Book.ContentHash = packageHash
+			analysisHash = packageHash
+		}
 		if err := s.books.SavePackage(pkg); err != nil {
 			return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
 				fmt.Errorf("save source article package: %w", err))
 		}
-		if !metadataOnly {
+		if resetAnalysis {
 			if err := s.books.SaveAnalysisManifest(BookAnalysisManifest{
 				Version:     bookAnalysisVersion,
 				BookID:      targetBookID,
-				ContentHash: contentHash,
+				ContentHash: analysisHash,
 				Status:      BookAnalysisPending,
 				CreatedAt:   acceptedAt,
 				UpdatedAt:   acceptedAt,
@@ -171,6 +182,26 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 		return SourceIngestReceipt{}, err
 	}
 	return receipt, nil
+}
+
+func sourceCoverageNote(envelope SourceArticleEnvelope) string {
+	kind := envelope.Metadata["content_kind"]
+	if kind == "" {
+		return "normalized source article"
+	}
+	return "normalized source article; content_kind=" + kind + "; coverage=provided_items_only; collection_method=" + envelope.Metadata["collection_method"]
+}
+
+func sourceCoverageChanged(pkg *BookKnowledgePackage, envelope SourceArticleEnvelope) bool {
+	if envelope.Metadata["content_kind"] == "" {
+		return false
+	}
+	for _, citation := range pkg.Citations {
+		if citation.Note != sourceCoverageNote(envelope) {
+			return true
+		}
+	}
+	return false
 }
 
 func sourceArticleMetadataChanged(book BookKnowledgeBook, envelope SourceArticleEnvelope) bool {
@@ -198,6 +229,9 @@ func updateSourceArticlePackageMetadata(pkg BookKnowledgePackage, envelope Sourc
 		pkg.Citations[index].SourceAccount = envelope.SourceAccount
 		pkg.Citations[index].SourceItemKey = envelope.SourceItemID
 		pkg.Citations[index].PublishedAt = envelope.PublishedAt
+		if envelope.Metadata["content_kind"] != "" {
+			pkg.Citations[index].Note = sourceCoverageNote(envelope)
+		}
 	}
 	return pkg
 }
@@ -361,7 +395,7 @@ func buildSourceArticlePackage(envelope SourceArticleEnvelope, contentHash, book
 				ChunkID:       chunkID,
 				SourceHTML:    envelope.SourceURL,
 				Anchor:        section.title,
-				Note:          "normalized source article",
+				Note:          sourceCoverageNote(envelope),
 				SourceType:    envelope.SourceType,
 				SourceAccount: envelope.SourceAccount,
 				SourceItemKey: envelope.SourceItemID,
