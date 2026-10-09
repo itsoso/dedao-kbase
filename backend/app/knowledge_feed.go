@@ -8,12 +8,13 @@ import (
 )
 
 type KnowledgeFeedQuery struct {
-	After        string
-	Limit        int
-	Source       string
-	UsagePolicy  string
-	ChangedSince string
-	BookID       string
+	After            string
+	Limit            int
+	Source           string
+	UsagePolicy      string
+	ChangedSince     string
+	BookID           string
+	SourceAccountKey string
 }
 
 func BuildKnowledgeFeedPage(store *BookKnowledgeStore, query KnowledgeFeedQuery) (KnowledgeFeedPage, error) {
@@ -38,12 +39,12 @@ func BuildKnowledgeFeedPage(store *BookKnowledgeStore, query KnowledgeFeedQuery)
 		if query.ChangedSince != "" && record.CreatedAt <= query.ChangedSince {
 			continue
 		}
-		if query.Source != "" {
+		if query.Source != "" || query.SourceAccountKey != "" {
 			release, err := store.LoadKnowledgeRelease(record.ReleaseID)
 			if err != nil {
 				return KnowledgeFeedPage{}, err
 			}
-			if release.Book.SourceType != query.Source {
+			if (query.Source != "" && release.Book.SourceType != query.Source) || (query.SourceAccountKey != "" && release.Book.SourceAccountKey != query.SourceAccountKey) {
 				continue
 			}
 		}
@@ -93,11 +94,12 @@ func BuildKnowledgeFeedPage(store *BookKnowledgeStore, query KnowledgeFeedQuery)
 func parseKnowledgeFeedQuery(values url.Values) KnowledgeFeedQuery {
 	limit, _ := strconv.Atoi(values.Get("limit"))
 	return KnowledgeFeedQuery{
-		After:        strings.TrimSpace(values.Get("after")),
-		Limit:        limit,
-		Source:       strings.TrimSpace(values.Get("source")),
-		UsagePolicy:  strings.TrimSpace(values.Get("policy")),
-		ChangedSince: strings.TrimSpace(values.Get("changed_since")),
-		BookID:       strings.TrimSpace(values.Get("book_id")),
+		After:            strings.TrimSpace(values.Get("after")),
+		Limit:            limit,
+		Source:           strings.TrimSpace(values.Get("source")),
+		UsagePolicy:      strings.TrimSpace(values.Get("policy")),
+		ChangedSince:     strings.TrimSpace(values.Get("changed_since")),
+		BookID:           strings.TrimSpace(values.Get("book_id")),
+		SourceAccountKey: strings.TrimSpace(values.Get("source_account_key")),
 	}
 }

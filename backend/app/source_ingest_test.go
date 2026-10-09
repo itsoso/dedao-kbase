@@ -71,7 +71,7 @@ func TestIngestSourceArticleIsIdempotentAndUpdatesKnowledge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load ingested package: %v", err)
 	}
-	if pkg.Book.SourceType != envelope.SourceType || pkg.Book.SourceKey != envelope.SourceItemID || pkg.Book.SourceAccount != envelope.SourceAccount {
+	if pkg.Book.SourceType != envelope.SourceType || pkg.Book.SourceKey != envelope.SourceItemID || pkg.Book.SourceAccount != envelope.SourceAccount || pkg.Book.SourceAccountKey != envelope.SourceAccountID {
 		t.Fatalf("missing book provenance: %#v", pkg.Book)
 	}
 	if pkg.Book.SourceHTML != "https://mp.weixin.qq.com/s/article-1" || pkg.Book.PublishedAt != envelope.PublishedAt || pkg.Book.ContentHash != receipt.ContentHash {
