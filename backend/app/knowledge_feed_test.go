@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -73,5 +74,26 @@ func saveFeedRelease(t *testing.T, store *BookKnowledgeStore, release KnowledgeR
 	}
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestKnowledgeFeedFollowsAccountAcrossNewArticlesWithoutDisplayNameLeakage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	for i, key := range []string{"selected", "other", "selected"} {
+		id := fmt.Sprintf("release-%d", i)
+		saveFeedRelease(t, store, KnowledgeRelease{ReleaseID: id, BookID: fmt.Sprintf("book-%d", i), ContentHash: id, UsagePolicy: BookUsageStandard, CreatedAt: fmt.Sprintf("2026-10-09T00:0%d:00Z", i), Book: BookKnowledgeBook{SourceType: "rss_entry", SourceAccount: "Same display name", SourceAccountKey: key}})
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	first := requestKBase(handler, http.MethodGet, "/api/knowledge/feed?source=rss_entry&source_account_key=selected&limit=1", "secret-token")
+	var page KnowledgeFeedPage
+	if err := json.Unmarshal(first.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ReleaseID != "release-0" || !page.HasMore {
+		t.Fatalf("wrong first page: %+v", page)
+	}
+	next := requestKBase(handler, http.MethodGet, "/api/knowledge/feed?source=rss_entry&source_account_key=selected&after=release-0", "secret-token")
+	if !strings.Contains(next.Body.String(), "release-2") || strings.Contains(next.Body.String(), "release-1") {
+		t.Fatalf("cross-account or missing new article: %s", next.Body.String())
 	}
 }

@@ -413,6 +413,7 @@ import {
 } from '../../wailsjs/go/backend/App'
 
 interface BookKnowledgeBook {
+    source_account_key?: string
     book_id: string
     dedao_id?: number
     enid?: string

@@ -211,6 +211,7 @@ func sourceArticleMetadataChanged(book BookKnowledgeBook, envelope SourceArticle
 		book.SourceType != envelope.SourceType ||
 		book.SourceKey != envelope.SourceItemID ||
 		book.SourceAccount != envelope.SourceAccount ||
+		book.SourceAccountKey != envelope.SourceAccountID ||
 		book.PublishedAt != envelope.PublishedAt
 }
 
@@ -221,6 +222,7 @@ func updateSourceArticlePackageMetadata(pkg BookKnowledgePackage, envelope Sourc
 	pkg.Book.SourceType = envelope.SourceType
 	pkg.Book.SourceKey = envelope.SourceItemID
 	pkg.Book.SourceAccount = envelope.SourceAccount
+	pkg.Book.SourceAccountKey = envelope.SourceAccountID
 	pkg.Book.PublishedAt = envelope.PublishedAt
 	pkg.Book.UpdatedAt = updatedAt
 	for index := range pkg.Citations {
@@ -406,19 +408,20 @@ func buildSourceArticlePackage(envelope SourceArticleEnvelope, contentHash, book
 	}
 	return BookKnowledgePackage{
 		Book: BookKnowledgeBook{
-			BookID:        bookID,
-			Title:         envelope.Title,
-			Author:        envelope.Author,
-			SourceHTML:    envelope.SourceURL,
-			SourceType:    envelope.SourceType,
-			SourceKey:     envelope.SourceItemID,
-			SourceAccount: envelope.SourceAccount,
-			PublishedAt:   envelope.PublishedAt,
-			ContentHash:   contentHash,
-			CreatedAt:     createdAt,
-			UpdatedAt:     updatedAt,
-			Status:        "ready",
-			Extractor:     "source-ingest-v1",
+			BookID:           bookID,
+			Title:            envelope.Title,
+			Author:           envelope.Author,
+			SourceHTML:       envelope.SourceURL,
+			SourceType:       envelope.SourceType,
+			SourceKey:        envelope.SourceItemID,
+			SourceAccount:    envelope.SourceAccount,
+			SourceAccountKey: envelope.SourceAccountID,
+			PublishedAt:      envelope.PublishedAt,
+			ContentHash:      contentHash,
+			CreatedAt:        createdAt,
+			UpdatedAt:        updatedAt,
+			Status:           "ready",
+			Extractor:        "source-ingest-v1",
 		},
 		Chapters:  chapters,
 		Chunks:    chunks,

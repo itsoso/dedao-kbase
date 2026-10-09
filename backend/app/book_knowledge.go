@@ -49,21 +49,22 @@ var (
 )
 
 type BookKnowledgeBook struct {
-	BookID        string `json:"book_id"`
-	DedaoID       int    `json:"dedao_id,omitempty"`
-	EnID          string `json:"enid,omitempty"`
-	Title         string `json:"title"`
-	Author        string `json:"author,omitempty"`
-	SourceHTML    string `json:"source_html,omitempty"`
-	SourceType    string `json:"source_type,omitempty"`
-	SourceKey     string `json:"source_key,omitempty"`
-	SourceAccount string `json:"source_account,omitempty"`
-	PublishedAt   string `json:"published_at,omitempty"`
-	ContentHash   string `json:"content_hash,omitempty"`
-	CreatedAt     string `json:"created_at,omitempty"`
-	UpdatedAt     string `json:"updated_at,omitempty"`
-	Status        string `json:"status,omitempty"`
-	Extractor     string `json:"extractor,omitempty"`
+	BookID           string `json:"book_id"`
+	DedaoID          int    `json:"dedao_id,omitempty"`
+	EnID             string `json:"enid,omitempty"`
+	Title            string `json:"title"`
+	Author           string `json:"author,omitempty"`
+	SourceHTML       string `json:"source_html,omitempty"`
+	SourceType       string `json:"source_type,omitempty"`
+	SourceKey        string `json:"source_key,omitempty"`
+	SourceAccount    string `json:"source_account,omitempty"`
+	SourceAccountKey string `json:"source_account_key,omitempty"`
+	PublishedAt      string `json:"published_at,omitempty"`
+	ContentHash      string `json:"content_hash,omitempty"`
+	CreatedAt        string `json:"created_at,omitempty"`
+	UpdatedAt        string `json:"updated_at,omitempty"`
+	Status           string `json:"status,omitempty"`
+	Extractor        string `json:"extractor,omitempty"`
 }
 
 type BookKnowledgeChapter struct {
