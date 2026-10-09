@@ -104,8 +104,21 @@ async function researchWorkspaceBrowserLayout(cssText) {
   const forceNativeChrome = process.platform === "darwin" && browserPath.includes("Google Chrome.app") && fs.existsSync("/usr/bin/arch");
   const browser = spawn(forceNativeChrome ? "/usr/bin/arch" : browserPath, forceNativeChrome
     ? ["-arm64", browserPath, ...browserArguments]
-    : browserArguments, { stdio: ["ignore", "ignore", "pipe"] });
-  const browserExit = new Promise((resolve) => browser.once("exit", resolve));
+    : browserArguments, { stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32" });
+  // Chrome launchers can exit before their renderer/profile-writing children.
+  let browserClosed = false;
+  const browserExit = new Promise((resolve) => browser.once("close", () => {
+    browserClosed = true;
+    resolve();
+  }));
+  const terminateBrowser = (signal) => {
+    try {
+      if (process.platform === "win32") browser.kill(signal);
+      else process.kill(-browser.pid, signal);
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  };
   let pageSocket;
   try {
     const targets = await new Promise((resolve, reject) => {
@@ -170,10 +183,10 @@ async function researchWorkspaceBrowserLayout(cssText) {
     return evaluation.result.value;
   } finally {
     pageSocket?.close();
-    if (browser.exitCode === null) browser.kill("SIGTERM");
+    terminateBrowser("SIGTERM");
     await Promise.race([browserExit, new Promise((resolve) => setTimeout(resolve, 3000))]);
-    if (browser.exitCode === null) {
-      browser.kill("SIGKILL");
+    if (!browserClosed) {
+      terminateBrowser("SIGKILL");
       await browserExit;
     }
     fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
