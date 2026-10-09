@@ -44,7 +44,8 @@ jobs:
           sudo apt-get install --yes \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
-            nginx
+            nginx \
+            ripgrep
 
       - name: Assert normal-user execution
         run: test "$(id -u)" -ne 0
@@ -76,9 +77,6 @@ jobs:
             -run 'TestResearchEvaluation|TestResearchOrchestrator|TestKBaseHTTPResearch|TestResearchIdentity'
           go test ./cmd/chatlog-agent ./cmd/kbase-server -count=1 \
             -run 'TestChatlogAgent|TestResearchServer'
-
-      - name: Smoke-test Research Agent processes
-        run: bash scripts/research-agent-smoke.sh
 
       - name: Test root-only permission ceiling
         run: |
@@ -216,3 +214,9 @@ jobs:
 
       - name: Verify Chatlog Worker packaging and rollback
         run: bash scripts/chatlog-agent-packaging-smoke.sh
+
+      # The real Chatlog upgrade bridge uses macOS protected storage and launchd.
+      - name: Smoke-test Research Agent processes
+        run: |
+          command -v rg || brew install ripgrep
+          bash scripts/research-agent-smoke.sh

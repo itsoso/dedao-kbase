@@ -183,6 +183,9 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 			break
 		}
 	}
+	if err := store.saveReleaseEvidence(&release, pkg); err != nil {
+		return nil, err
+	}
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		return nil, err
 	}

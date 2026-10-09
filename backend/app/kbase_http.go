@@ -600,6 +600,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAgentPackages(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") && strings.HasSuffix(r.URL.Path, "/evidence") {
+		h.handleReleaseEvidence(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
 		h.handleKnowledgeReleases(w, r)
 		return
