@@ -60,9 +60,11 @@ class TransactionTests(unittest.TestCase):
             (source / '.git').mkdir()
             (source / 'frontend-web').mkdir()
             (source / 'frontend-web/index.html').write_text('new')
+            (source / 'frontend-web/app.js').write_text('new app')
             web = source.parent / 'frontend-web'
             web.mkdir()
             (web / 'index.html').write_text('new')
+            (web / 'app.js').write_text('new app')
             binary = source.parent / 'kbase-server'
             binary.write_bytes(b'new-binary')
             production = root / 'live'
@@ -137,6 +139,7 @@ class TransactionTests(unittest.TestCase):
                  patch.object(m, 'reject_mounts'), \
                  patch.object(m, 'secure', side_effect=lambda path, directory=False: path.lstat()), \
                  patch.object(m, 'run', side_effect=run), patch.object(m, 'get', side_effect=get), \
+                 patch.object(m, 'fetch', side_effect=lambda url: b'wrong' if fault == 'web' else (production / 'frontend-web' / url.rsplit('/', 1)[1]).read_bytes()), \
                  patch.object(m, 'digest_file', side_effect=digest), \
                  patch.object(m.shutil, 'rmtree', side_effect=remove) as remover, \
                  patch.object(m.os, 'replace', side_effect=replace):
@@ -167,7 +170,7 @@ class TransactionTests(unittest.TestCase):
         self.scenario(None)
 
     def test_failures_keep_original_intent_and_lease(self):
-        for fault in ('revision', 'stop', 'remove', 'replace', 'start', 'nginx', 'reload'):
+        for fault in ('revision', 'stop', 'remove', 'replace', 'start', 'nginx', 'reload', 'web'):
             with self.subTest(fault=fault):
                 self.scenario(fault)
 

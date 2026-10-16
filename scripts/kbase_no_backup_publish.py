@@ -95,7 +95,11 @@ def digest_tree(root, require_root=True):
         if (count > 10000 or info.st_dev != root.lstat().st_dev or path.is_mount()
                 or (require_root and (info.st_uid != 0 or info.st_mode & 0o022))):
             raise PublishError('unsafe artifact inventory')
+        mode = stat.S_IMODE(info.st_mode)
+        if require_root and mode != (0o755 if stat.S_ISDIR(info.st_mode) else 0o644):
+            raise PublishError('Web assets must be traversable and readable by the service')
         digest.update((str(path.relative_to(root)) + '\0').encode())
+        digest.update(str(mode).encode())
         if stat.S_ISDIR(info.st_mode):
             pending.extend(sorted(path.iterdir(), reverse=True))
         elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
@@ -110,13 +114,17 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise PublishError('unexpected remote redirect')
 
 
-def get(url):
+def fetch(url):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     with opener.open(urllib.request.Request(url, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'kbase-publisher'}), timeout=20) as response:
         raw = response.read(2_000_001)
         if len(raw) > 2_000_000:
             raise PublishError('remote response exceeds bound')
-        return json.loads(raw)
+        return raw
+
+
+def get(url):
+    return json.loads(fetch(url))
 
 
 def check_ci(revision, current, runs):
@@ -234,7 +242,18 @@ def execute(args):
     for name, value in {'token': os.urandom(32).hex(), 'label': 'kbase-no-backup', 'stage': str(journal_path), 'started_at': str(int(time.time()))}.items():
         write(LEASE / name, (value + '\n').encode())
     sync(LEASE.parent)
+    lease_info = LEASE.lstat()
+    lease_token = (LEASE / 'token').read_bytes()
+    def check_lease():
+        secure(LEASE, directory=True)
+        now = LEASE.lstat()
+        if ((now.st_dev, now.st_ino) != (lease_info.st_dev, lease_info.st_ino)
+                or (LEASE / 'token').read_bytes() != lease_token
+                or (LEASE / 'stage').read_bytes() != (str(journal_path) + '\n').encode()
+                or {item.name for item in LEASE.iterdir()} != {'token', 'label', 'stage', 'started_at'}):
+            raise PublishError('publication lease changed')
     try:
+        check_lease()
         run('/usr/bin/systemctl', 'stop', 'dedao-kbase')
         if run('/usr/bin/systemctl', 'show', 'dedao-kbase', '--property=MainPID', '--value') != '0':
             raise PublishError('server still running')
@@ -246,9 +265,11 @@ def execute(args):
         digest_tree(live_web, require_root=False)
         if not shutil.rmtree.avoids_symlink_attacks:
             raise PublishError('safe deletion unavailable')
+        check_lease()
         shutil.rmtree(live_web)
         os.replace(web, live_web)
         sync(PRODUCTION)
+        check_lease()
         os.chmod(binary, 0o755)
         os.replace(binary, PRODUCTION / 'bin/kbase-server')
         sync(PRODUCTION / 'bin')
@@ -278,8 +299,13 @@ def execute(args):
         write(locations, candidate_proxy, stat.S_IMODE(locations.stat().st_mode))
         run('/usr/sbin/nginx', '-t')
         run('/usr/bin/systemctl', 'reload', 'nginx')
+        for name in ('index.html', 'app.js'):
+            raw = fetch('https://kbase.executor.life/' + name)
+            if hashlib.sha256(raw).hexdigest() != digest_file(live_web / name):
+                raise PublishError('public Web bytes differ from installed artifact')
         journal['state'] = 'SUCCEEDED'
         write(journal_path, json.dumps(journal).encode())
+        check_lease()
         for name in ('token', 'label', 'stage', 'started_at'):
             (LEASE / name).unlink()
         LEASE.rmdir()
