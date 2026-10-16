@@ -696,3 +696,22 @@ it with explicit `KBASE_REMOTE_URL`, `KBASE_SOURCE_AGENT_ID`, and a dedicated
 sessions remain in macOS Keychain and enrollment listens on loopback only.
 Production scheduling must remain disabled until the bounded G6 probe in the
 collector delivery dossier passes.
+
+### Health 登录的无备份发布
+
+`scripts/kbase_no_backup_publish.py` 是独立、显式的 server/Web 发布入口，用于从
+该脚本固定的兼容基线发布 Health 登录能力。它不运行上方旧 cutover，也不复制
+旧代码、数据库、配置或 worker。此前直接部署契约继续适用于其原范围；本入口
+只允许代码列出的认证、Web 与发布文件变化，拒绝 worker 协议及数据布局变化。
+
+先在 root 管理的新 source checkout 固定 current main，按上述非 root 流程完成
+构建和测试；将该源码、相邻的 `kbase-server` 和 `frontend-web` 制品改为 root 所有且
+不可被其他用户写入。使用系统 Python `-I -S -B` 运行源码中的发布器，传入完整
+`--revision`、`--binary-sha256`、`--web-sha256`。默认仅预检，加 `--apply` 才切换。
+它实时核验完整主干 CI、源码范围、制品摘要和运行版本，停止 server 后移除旧 Web，
+逐项安装新制品；worker 继续运行，凭据和数据保持原样。随后只为 Health 登录入口
+追加 Nginx 限流 zone/location，经 `nginx -t` 后 reload；认证仍保持关闭。
+
+小型状态 journal 和共享发布 lease 记录操作结果。失败保留原 journal/lease，
+禁止自动重试、回滚或重新领取发布；需要针对原现场单独审查。`SUCCEEDED` 只证明
+代码发布与健康检查，不代表统一认证启用，更不代表本人浏览器登录验收。
