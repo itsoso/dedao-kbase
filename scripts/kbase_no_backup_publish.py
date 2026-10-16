@@ -299,8 +299,8 @@ def execute(args):
         write(locations, candidate_proxy, stat.S_IMODE(locations.stat().st_mode))
         run('/usr/sbin/nginx', '-t')
         run('/usr/bin/systemctl', 'reload', 'nginx')
-        for name in ('index.html', 'app.js'):
-            raw = fetch('https://kbase.executor.life/' + name)
+        for route, name in (('/', 'index.html'), ('/app.js', 'app.js')):
+            raw = fetch('https://kbase.executor.life' + route)
             if hashlib.sha256(raw).hexdigest() != digest_file(live_web / name):
                 raise PublishError('public Web bytes differ from installed artifact')
         journal['state'] = 'SUCCEEDED'

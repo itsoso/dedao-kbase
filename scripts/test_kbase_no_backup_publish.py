@@ -156,13 +156,18 @@ class TransactionTests(unittest.TestCase):
                     raise m.PublishError('injected after binary replacement')
             def digest(path):
                 return args.binary_sha256 if str(path).startswith('/proc/') else real_digest(path)
+            def fetch(url):
+                if url.endswith('/index.html'):
+                    raise m.PublishError('ServeFile redirects index.html')
+                routes = {'https://kbase.executor.life/': 'index.html', 'https://kbase.executor.life/app.js': 'app.js'}
+                return b'wrong' if fault == 'web' else (production / 'frontend-web' / routes[url]).read_bytes()
             with patch.multiple(m, __file__=str(source / 'scripts/kbase_no_backup_publish.py'),
                                 PRODUCTION=production, STATE=state, LEASE=lease, PROXY_LOCATIONS=proxy,
                                 PROXY_ZONE=zone, PROXY_SERVER=server, CGROUP=root / 'cgroup'), \
                  patch.object(m, 'reject_mounts'), \
                  patch.object(m, 'secure', side_effect=lambda path, directory=False: path.lstat()), \
                  patch.object(m, 'run', side_effect=run), patch.object(m, 'get', side_effect=get), \
-                 patch.object(m, 'fetch', side_effect=lambda url: b'wrong' if fault == 'web' else (production / 'frontend-web' / url.rsplit('/', 1)[1]).read_bytes()), \
+                 patch.object(m, 'fetch', side_effect=fetch), \
                  patch.object(m, 'digest_file', side_effect=digest), \
                  patch.object(m.shutil, 'rmtree', side_effect=remove) as remover, \
                  patch.object(m.os, 'replace', side_effect=replace):
