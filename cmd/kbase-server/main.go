@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -77,6 +78,17 @@ func runCommandWithServerRunner(
 	stdout io.Writer,
 	runServer func(kBaseServerConfig) error,
 ) error {
+	if len(args) == 1 && args[0] == "--build-info" {
+		result := map[string]string{"revision": buildRevision}
+		if info, ok := debug.ReadBuildInfo(); ok {
+			for _, setting := range info.Settings {
+				if setting.Key == "vcs.revision" || setting.Key == "vcs.modified" {
+					result[setting.Key] = setting.Value
+				}
+			}
+		}
+		return json.NewEncoder(stdout).Encode(result)
+	}
 	flags := flag.NewFlagSet("kbase-server", flag.ContinueOnError)
 	addr := flags.String("addr", envDefault("KBASE_HTTP_ADDR", "127.0.0.1:8719"), "HTTP listen address")
 	root := flags.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")

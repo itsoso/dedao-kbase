@@ -87,6 +87,18 @@ func TestEvolutionEnabledEnvironmentDefaultsOnAndAcceptsExplicitOff(t *testing.T
 	}
 }
 
+func TestBuildInfoDoesNotStartServerOrReadInvalidConfiguration(t *testing.T) {
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "invalid")
+	var output bytes.Buffer
+	err := runCommandWithServerRunner([]string{"--build-info"}, &output, func(kBaseServerConfig) error {
+		t.Fatal("build info must not start the server")
+		return nil
+	})
+	if err != nil || !strings.Contains(output.String(), `"revision":"`+buildRevision+`"`) {
+		t.Fatalf("build info failed: %v %s", err, output.String())
+	}
+}
+
 func TestRunCommandHelpIgnoresInvalidEvolutionEnvironment(t *testing.T) {
 	t.Setenv("KBASE_EVOLUTION_ENABLED", "invalid")
 	if err := runCommandWithServerRunner([]string{"--help"}, &bytes.Buffer{}, func(kBaseServerConfig) error {

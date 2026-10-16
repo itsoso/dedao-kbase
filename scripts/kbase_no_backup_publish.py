@@ -21,11 +21,15 @@ import urllib.request
 
 BASE = 'dad9515ad4558b587529a53fdd4d09f3b2aa5374'
 PRODUCTION = Path('/opt/dedao-kbase')
-LEASE = Path('/var/lock/health-app-release')
+LEASE = Path('/run/lock/health-app-release')
 STATE = Path('/var/lib/dedao-kbase-release-state')
+PROXY_LOCATIONS = Path('/etc/dedao-kbase/kbase.locations.conf')
+PROXY_ZONE = Path('/etc/nginx/conf.d/kbase-health-login-limit.conf')
+PROXY_SERVER = Path('/etc/nginx/conf.d/kbase.executor.life.conf')
+CGROUP = Path('/sys/fs/cgroup/system.slice/dedao-kbase.service')
 API = 'https://api.github.com/repos/itsoso/dedao-kbase'
 ALLOWED = {'backend/app/health_login.go', 'backend/app/health_login_test.go', 'backend/app/kbase_http.go',
-           'cmd/kbase-server/main.go', 'deploy/nginx/browser-session-proxy-smoke.sh',
+           'cmd/kbase-server/main.go', 'cmd/kbase-server/main_test.go', 'deploy/nginx/browser-session-proxy-smoke.sh',
            'deploy/nginx/kbase.executor.life.conf', 'deploy/nginx/kbase.locations.conf.template',
            'docs/_generated/system-map.json', 'docs/plans/health-browser-login.md', 'frontend-web/app.js',
            'frontend-web/scripts/browser-cookie-session-smoke.mjs', 'frontend-web/scripts/browser-session-settings-smoke.mjs',
@@ -50,6 +54,8 @@ def run(*args, cwd=None):
 def secure(path, directory=False):
     for item in [*reversed(path.parents), path]:
         info = item.lstat()
+        if item == Path('/run/lock') and stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o1777:
+            continue
         folder = item != path or directory
         if (info.st_uid != 0 or info.st_mode & 0o022 or
                 not (stat.S_ISDIR(info.st_mode) if folder else stat.S_ISREG(info.st_mode)) or
@@ -64,6 +70,20 @@ def digest_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def reject_mounts(root):
+    raw = Path('/proc/self/mountinfo').read_text()
+    for line in raw.splitlines():
+        fields = line.split(' ')
+        if len(fields) < 10:
+            raise PublishError('invalid mount inventory')
+        value = fields[4]
+        for code, character in (('040', ' '), ('011', '\t'), ('012', '\n'), ('134', chr(92))):
+            value = value.replace(chr(92) + code, character)
+        point = Path(value)
+        if point == root or point.is_relative_to(root):
+            raise PublishError('live artifact contains mount boundary')
 
 
 def digest_tree(root, require_root=True):
@@ -155,11 +175,12 @@ def execute(args):
     source = Path(__file__).absolute().parent.parent
     secure(source, directory=True)
     for path in source.rglob('*'):
-        if '.git' not in path.relative_to(source).parts and 'node_modules' not in path.relative_to(source).parts and 'dist' not in path.relative_to(source).parts:
+        if 'node_modules' not in path.relative_to(source).parts and 'dist' not in path.relative_to(source).parts:
             secure(path, directory=path.is_dir())
-    if run('/usr/bin/git', 'rev-parse', 'HEAD', cwd=source) != args.revision or run('/usr/bin/git', 'status', '--porcelain', '--untracked-files=no', cwd=source):
+    git = ('/usr/bin/git', '--git-dir=' + str(source / '.git'), '--work-tree=' + str(source), '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null')
+    if run(*git, 'rev-parse', 'HEAD', cwd=source) != args.revision or run(*git, 'status', '--porcelain', '--untracked-files=no', cwd=source):
         raise PublishError('clean exact source required')
-    changed = set(run('/usr/bin/git', 'diff', '--name-only', BASE, args.revision, cwd=source).splitlines())
+    changed = set(run(*git, 'diff', '--no-ext-diff', '--no-textconv', '--name-only', BASE, args.revision, cwd=source).splitlines())
     if not changed <= ALLOWED:
         raise PublishError('server-only compatibility scope exceeded')
     runs = get(API + '/actions/workflows/kbase-build-gates.yml/runs?event=push&head_sha=' + args.revision + '&per_page=100')
@@ -171,6 +192,9 @@ def execute(args):
     secure(binary)
     if digest_file(binary) != args.binary_sha256 or digest_tree(web) != args.web_sha256:
         raise PublishError('candidate checksum differs')
+    info = json.loads(run('/usr/sbin/runuser', '--user', 'dedao-kbase', '--', '/usr/bin/env', '-i', str(binary), '--build-info'))
+    if info != {'revision': args.revision, 'vcs.revision': args.revision, 'vcs.modified': 'false'}:
+        raise PublishError('binary source revision or clean build proof differs')
     if digest_tree(web) != digest_tree(source / 'frontend-web'):
         raise PublishError('Web artifact differs from reviewed source')
     health = get('https://kbase.executor.life/health')
@@ -184,14 +208,13 @@ def execute(args):
         raise PublishError('server process containment differs')
     if run('/usr/bin/systemctl', 'show', 'dedao-kbase', '--property=WorkingDirectory', '--value') != str(PRODUCTION):
         raise PublishError('server working directory differs')
-    locations = Path('/etc/dedao-kbase/kbase.locations.conf')
-    zone = Path('/etc/nginx/conf.d/kbase-health-login-limit.conf')
+    locations, zone = PROXY_LOCATIONS, PROXY_ZONE
     secure(locations)
     original_proxy = locations.read_bytes()
     candidate_proxy = proxy_patch(original_proxy)
     if zone.exists():
         raise PublishError('rate zone already exists')
-    server_config = Path('/etc/nginx/conf.d/kbase.executor.life.conf')
+    server_config = PROXY_SERVER
     secure(server_config)
     if server_config.read_bytes().count(b'include /etc/dedao-kbase/kbase.locations.conf;') != 1:
         raise PublishError('proxy include differs')
@@ -215,10 +238,11 @@ def execute(args):
         run('/usr/bin/systemctl', 'stop', 'dedao-kbase')
         if run('/usr/bin/systemctl', 'show', 'dedao-kbase', '--property=MainPID', '--value') != '0':
             raise PublishError('server still running')
-        group = Path('/sys/fs/cgroup/system.slice/dedao-kbase.service')
+        group = CGROUP
         if group.exists() and any(p.read_text().strip() for p in group.rglob('cgroup.procs')):
             raise PublishError('server descendants remain')
         live_web = PRODUCTION / 'frontend-web'
+        reject_mounts(live_web)
         digest_tree(live_web, require_root=False)
         if not shutil.rmtree.avoids_symlink_attacks:
             raise PublishError('safe deletion unavailable')
@@ -282,7 +306,7 @@ def main():
         os.umask(0o077)
         os.environ.clear()
         os.environ.update(ENV)
-        lock = Path('/var/lock/kbase-no-backup.lock')
+        lock = Path('/run/lock/kbase-no-backup.lock')
         fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'r+b') as stream:
             secure(lock)
