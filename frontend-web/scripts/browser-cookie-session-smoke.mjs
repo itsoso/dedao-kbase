@@ -68,12 +68,14 @@ function createHarness({
   now = Date.parse("2026-07-28T22:00:00Z"),
   randomByte = 0x5a,
   familyEpoch = 1,
+  healthLoginEnabled = false,
   storageAccessError = false,
 } = {}) {
   const local = new Map(localEntries);
   const session = new Map(sessionEntries);
   const fetchCalls = [];
   const broadcasts = [];
+  const navigations = [];
   const storageSignals = [];
   const consoleMessages = [];
   const objectURLs = [];
@@ -136,6 +138,7 @@ function createHarness({
   const testWindow = {
     BroadcastChannel: TestBroadcastChannel,
     location: {
+      assign(url) { navigations.push(url); },
       pathname: "/unit-test",
       origin: "https://kbase.example",
     },
@@ -243,6 +246,7 @@ function createHarness({
       epoch: headers.get("X-KBase-Browser-Epoch") || "",
       signal: options.signal || null,
     };
+    if (call.url === "/browser/health/config") return responseJSON(200, { enabled: healthLoginEnabled });
     fetchCalls.push(call);
     if (call.url === "/browser/session" && call.method === "GET") {
       const currentEpoch = typeof familyEpoch === "function" ? familyEpoch() : familyEpoch;
@@ -280,6 +284,7 @@ globalThis.__auth = {
 };`, context, { filename: "frontend-web/app.js" });
 
   return {
+    navigations,
     ...context.__auth,
     local,
     session,
@@ -2155,3 +2160,30 @@ assert.match(
 assert.equal(finalPrivateAssetCommit.browserSessionState.operationControllers.size, 0);
 
 console.log("browser cookie session smoke passed");
+
+
+const healthLoginFlow = createHarness({
+  healthLoginEnabled: true,
+  responder: async (call) => {
+    if (call.url === "/api/browser/session") return responseJSON(401, { error: "unauthorized" });
+    if (call.url === "/browser/health/start") {
+      assert.equal(call.method, "POST");
+      assert.ok(call.clientID);
+      assert.equal(call.authorization, "");
+      return responseJSON(200, { authorization_url: "https://health.example.test/connect/kbase?state=synthetic" });
+    }
+    throw new Error(`Unexpected Health login fetch: ${call.url}`);
+  },
+});
+await assert.rejects(healthLoginFlow.ensureBrowserSession(), /正在前往 Health/);
+assert.deepEqual(healthLoginFlow.navigations, ["https://health.example.test/connect/kbase?state=synthetic"]);
+assert.equal(healthLoginFlow.fetchCalls.some(c => c.url === "/browser/session"), false);
+console.log("Health login redirect smoke passed");
+
+const malformedLoginConfig = createHarness({ healthLoginEnabled: null,
+  responder: async call => {
+    if (call.url === "/api/browser/session") return responseJSON(401, { error: "unauthorized" });
+    throw new Error(`Unexpected fallback: ${call.url}`);
+  },
+});
+await assert.rejects(malformedLoginConfig.ensureBrowserSession(), /登录方式配置无效/);

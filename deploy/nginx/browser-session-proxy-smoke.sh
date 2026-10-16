@@ -144,6 +144,7 @@ pid ${temporary}/nginx.pid;
 error_log ${temporary}/nginx-error.log;
 events { worker_connections 64; }
 http {
+    limit_req_zone \$binary_remote_addr zone=kbase_health_login:1m rate=6r/m;
     access_log off;
     client_body_temp_path ${temporary}/nginx-prefix/client-body;
     proxy_temp_path ${temporary}/nginx-prefix/proxy;

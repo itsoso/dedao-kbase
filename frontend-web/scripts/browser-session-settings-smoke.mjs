@@ -218,6 +218,7 @@ function createHarness({ responder }) {
         epoch: headers.get("X-KBase-Browser-Epoch") || "",
         signal: options.signal || null,
       };
+      if (call.url === "/browser/health/config") return responseJSON(200, { enabled: false });
       fetchCalls.push(call);
       if (call.url === "/browser/session" && call.method === "GET") {
         return responseJSON(200, {

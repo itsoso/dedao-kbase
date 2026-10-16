@@ -31,6 +31,7 @@ const (
 )
 
 type KBaseHTTPConfig struct {
+	HealthLogin             *HealthLogin
 	Store                   *BookKnowledgeStore
 	EvolutionStore          *EvolutionControlStore
 	EvolutionEnabled        bool
@@ -109,6 +110,7 @@ type DedaoLibraryService interface {
 }
 
 type kbaseHTTPHandler struct {
+	healthLogin             *HealthLogin
 	store                   *BookKnowledgeStore
 	evolutionStore          *EvolutionControlStore
 	evolutionEnabled        bool
@@ -279,6 +281,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		authToken:               authToken,
 		releaseRevision:         releaseRevision,
 		browserSessionSecret:    browserSessionSecret,
+		healthLogin:             cfg.HealthLogin,
 		browserSessions:         browserSessions,
 		agentPublisherToken:     agentPublisherToken,
 		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
@@ -6609,6 +6612,8 @@ func (h *kbaseHTTPHandler) handleBrowserSessionAdminRevokeAll(w http.ResponseWri
 
 func (h *kbaseHTTPHandler) handleBrowserSessionRoute(w http.ResponseWriter, r *http.Request) bool {
 	switch r.URL.Path {
+	case "/browser/health/config", "/browser/health/start", "/browser/health/callback":
+		h.handleHealthLogin(w, r)
 	case "/browser/session":
 		h.handleBrowserSessionLogin(w, r)
 	case "/browser/session/migrate":

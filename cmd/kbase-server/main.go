@@ -307,7 +307,15 @@ func serveKBaseServer(
 		}
 	}
 
+	healthLogin, err := app.HealthLoginFromEnv(browserSessions.PublicOrigin)
+	if err != nil {
+		return err
+	}
+	if healthLogin != nil && browserSessions.Store == nil {
+		return errors.New("Health login requires browser session storage")
+	}
 	handlerConfig := app.KBaseHTTPConfig{
+		HealthLogin:            healthLogin,
 		Store:                  bookStore,
 		EvolutionStore:         evolutionStore,
 		EvolutionEnabled:       config.EvolutionEnabled,
