@@ -82,6 +82,9 @@ context.fetch = async (url, options = {}) => {
     clientID: headers.get("X-KBase-Browser-Client-ID") || "",
     epoch: headers.get("X-KBase-Browser-Epoch") || "",
   });
+  if (url === "/browser/health/config") {
+    return Response.json({ enabled: false });
+  }
   if (url === "/api/browser/session") {
     statusCalls += 1;
     if (statusCalls === 1) {
