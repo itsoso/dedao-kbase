@@ -36,6 +36,29 @@ class PublisherTests(unittest.TestCase):
             with self.assertRaises(m.PublishError):
                 m.digest_tree(root, require_root=False)
 
+    def test_web_mode_is_bound_and_private_assets_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o755)
+            asset = root / 'index.html'
+            asset.write_text('page')
+            asset.chmod(0o644)
+            original = Path.lstat
+            def root_owned(path):
+                info = original(path)
+                return SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_dev=info.st_dev,
+                                       st_ino=info.st_ino, st_nlink=info.st_nlink)
+            with patch.object(Path, 'lstat', autospec=True, side_effect=root_owned):
+                digest = m.digest_tree(root)
+                asset.chmod(0o600)
+                self.assertNotEqual(digest, m.digest_tree(root, require_root=False))
+                with self.assertRaises(m.PublishError):
+                    m.digest_tree(root)
+                asset.chmod(0o644)
+                root.chmod(0o700)
+                with self.assertRaises(m.PublishError):
+                    m.digest_tree(root)
+
     def test_unknown_prior_operation_never_retried(self):
         for state in ('STARTED', 'NEEDS_OPERATOR', 'SUCCEEDED'):
             with self.assertRaises(m.PublishError):
