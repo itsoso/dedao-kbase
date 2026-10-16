@@ -186,6 +186,7 @@ jobs:
 
       - name: Verify direct-deployment contract
         run: |
+          python3 scripts/test_kbase_no_backup_publish.py
           bash scripts/kbase-direct-deployment-smoke.sh
           bash -n scripts/evolution-workers-direct-cutover.sh
           bash scripts/evolution-workers-deployment-smoke.sh
