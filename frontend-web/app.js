@@ -986,6 +986,26 @@ async function establishBrowserSession(expectedGeneration, skipStatus = false) {
     }
   }
   assertBrowserSessionGeneration(expectedGeneration);
+  const loginConfigResponse = await fetch("/browser/health/config", { credentials: "same-origin", cache: "no-store" });
+  if (!loginConfigResponse.ok) throw new Error("无法读取登录方式，请稍后重试");
+  const loginConfig = await loginConfigResponse.json();
+  if (typeof loginConfig?.enabled !== "boolean") throw new Error("登录方式配置无效");
+  assertBrowserSessionGeneration(expectedGeneration);
+  if (loginConfig.enabled === true) {
+    const response = await fetch("/browser/health/start", {
+      method: "POST", credentials: "same-origin", cache: "no-store",
+      headers: { [browserClientIDHeader]: getBrowserClientID() },
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(expectedGeneration);
+    if (!response.ok) throw browserResponseError(response, result);
+    const destination = new URL(result.payload.authorization_url);
+    if (destination.protocol !== "https:" || destination.username || destination.password || destination.pathname !== "/connect/kbase") {
+      throw new Error("统一登录地址无效");
+    }
+    window.location.assign(destination.href);
+    throw new Error("正在前往 Health 登录…");
+  }
   const snapshot = await loadBrowserClientEpoch(expectedGeneration);
   assertBrowserSessionGeneration(expectedGeneration);
   const migration = await migrateLegacyBrowserSession(snapshot, expectedGeneration);
